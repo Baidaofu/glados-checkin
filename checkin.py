@@ -8,6 +8,8 @@ import requests
 import json
 import os
 import sys
+import html
+import re
 import time
 from datetime import datetime
 
@@ -165,19 +167,64 @@ class GLaDOS:
 
 # ================= 推送函数 =================
 
-def telegram_push(token, chat_id, title, content):
-    if not token or not chat_id: return
-    try:
-        import re
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        text = f"<b>{title}</b>\n\n{content}"
-        text = re.sub(r"<(?!\/?(b)\b)[^>]+>", "", text)
-        
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        requests.post(url, json=data, timeout=5)
-        log("✅ Telegram 推送成功")
-    except Exception as e:
-        log(f"❌ Telegram 推送失败: {e}")
+def build_report(results, success_cnt, total, cur_time):
+    """生成富文本 HTML 报告: 粗体标题 + 每账号一个可折叠引用块
+    (Bot API 免费支持 HTML 实体，无需 Telegram Premium)"""
+    def clip(s, n):
+        s = str(s)
+        return s if len(s) <= n else s[:n] + "…"
+
+    e = html.escape
+    header = f"🚀 <b>GLaDOS 签到</b>  ✅ {success_cnt}/{total}"
+    blocks = []
+    for r in results:
+        blocks.append(
+            "<blockquote expandable>"
+            f"👤 {e(clip(r['email'], 100))}\n"
+            f"💰 积分: {e(clip(r['points'], 20))} ({e(clip(r['change'], 20))})\n"
+            f"📆 剩余: {e(clip(r['left_days'], 20))} 天\n"
+            f"🎯 签到: {e(clip(r['msg'], 200))}\n"
+            f"🎛 策略: {e(clip(r['plan'], 20))}\n"
+            f"🔁 兑换: {e(clip(r['exchange'], 150))}\n"
+            f"🎁 可兑换选项:\n{e(clip(r['options'], 600))}"
+            "</blockquote>"
+        )
+    # 分块拼接，单条消息不超过 Telegram 4096 字符限制
+    messages, cur = [], header
+    for b in blocks:
+        if cur != header and len(cur) + len(b) + 20 > 3900:
+            messages.append(cur)
+            cur = header
+        cur += "\n\n" + b
+    messages.append(cur)
+    messages[-1] += f"\n\n🕘 {e(cur_time)}"
+    return messages
+
+def telegram_push(token, chat_id, messages):
+    if not token or not chat_id or not messages: return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    sent = 0
+    for m in messages:
+        try:
+            data = {"chat_id": chat_id, "text": m, "parse_mode": "HTML",
+                    "link_preview_options": {"is_disabled": True}}
+            resp = requests.post(url, json=data, timeout=10)
+            if resp.status_code == 200:
+                sent += 1
+                continue
+            try: desc = (resp.json() or {}).get('description', '') or ''
+            except Exception: desc = ''
+            if 'parse' in desc.lower():
+                # 兼容兜底: 不支持可折叠引用时退回纯粗体重发
+                plain = re.sub(r'</?blockquote[^>]*>', '', m)
+                requests.post(url, json={"chat_id": chat_id, "text": plain, "parse_mode": "HTML"}, timeout=10)
+                sent += 1
+            else:
+                log(f"❌ Telegram 推送失败: HTTP {resp.status_code} {desc}")
+        except Exception as e:
+            log(f"❌ Telegram 推送失败: {e}")
+    if sent == len(messages):
+        log(f"✅ Telegram 推送成功 ({sent}/{len(messages)} 条)")
 
 # ================= 主程序 =================
 
@@ -224,27 +271,25 @@ def main():
 
         # 保持要求的全空行排版
         plan_desc = "未设置" if plan is None else ("不兑换" if plan == OFF_PLAN else plan)
-        user_result = (
-            f"👤 {g.email}\n\n"
-            f"当前积分: {g.points} ({g.points_change})\n\n"
-            f"剩余天数: {g.left_days} 天\n\n"
-            f"签到结果: {msg}\n\n"
-            f"兑换策略: {plan_desc}\n\n"
-            f"自动兑换: {exchange_msg}\n\n"
-            f"🎁 兑换选项:\n\n"
-            f"{g.exchange_info}"
-        )
-        results.append(user_result)
+        results.append({
+            "email": g.email,
+            "points": g.points,
+            "change": g.points_change,
+            "left_days": g.left_days,
+            "msg": msg,
+            "plan": plan_desc,
+            "exchange": exchange_msg,
+            "options": g.exchange_info,
+        })
 
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     
     if tg_token and tg_chat_id:
-        # 此时 success_cnt 代表今天已经完成签到的账号数量
-        title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
+        # success_cnt 代表今天已完成签到的账号数量
         cur_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        content = "\n\n".join(results) + f"\n\n时间: {cur_time}"
-        telegram_push(tg_token, tg_chat_id, title, content)
+        messages = build_report(results, success_cnt, len(cookies), cur_time)
+        telegram_push(tg_token, tg_chat_id, messages)
 
 if __name__ == '__main__':
     main()
