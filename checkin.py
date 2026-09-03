@@ -167,64 +167,115 @@ class GLaDOS:
 
 # ================= 推送函数 =================
 
-def build_report(results, success_cnt, total, cur_time):
-    """生成富文本 HTML 报告: 粗体标题 + 每账号一个可折叠引用块
-    (Bot API 免费支持 HTML 实体，无需 Telegram Premium)"""
-    def clip(s, n):
-        s = str(s)
-        return s if len(s) <= n else s[:n] + "…"
+def _clip(s, n):
+    s = str(s)
+    return s if len(s) <= n else s[:n] + "…"
 
+def _md(value, limit):
+    """转义 Markdown 特殊字符并截断, 防止内容破坏富文本结构"""
+    s = str(value)
+    for ch in ("\\", "`", "*", "_", "~", "[", "]"):
+        s = s.replace(ch, "\\" + ch)
+    return _clip(s, limit)
+
+def _legacy(value, limit):
+    """HTML 转义并截断"""
+    return html.escape(_clip(value, limit))
+
+def _rich_block(r):
+    """单个账号的富文本卡片 (Markdown <details> 可折叠区块)"""
+    summary = f"👤 {_md(r['email'], 80)} · {_md(r['plan'], 20)} · {_md(r['exchange'], 30)}"
+    opts = "\n".join("- " + ln for ln in str(r["options"]).splitlines() if ln.strip()) or "- 无"
+    body = (
+        f"- 💰 积分: {_md(r['points'], 20)} ({_md(r['change'], 20)})\n"
+        f"- 📆 剩余: {_md(r['left_days'], 20)} 天\n"
+        f"- 🎯 签到: {_md(r['msg'], 200)}\n"
+        f"- 🎛 策略: {_md(r['plan'], 20)}\n"
+        f"- 🔁 兑换: {_md(r['exchange'], 150)}\n"
+        f"\n**🎁 可兑换选项**\n\n{opts}\n"
+    )
+    return f"<details><summary>{summary}</summary>\n\n{body}\n</details>"
+
+def _legacy_block(r):
+    """单个账号的旧版 HTML 卡片 (可折叠引用, 兜底用)"""
     e = html.escape
-    header = f"🚀 <b>GLaDOS 签到</b>  ✅ {success_cnt}/{total}"
-    blocks = []
-    for r in results:
-        blocks.append(
-            "<blockquote expandable>"
-            f"👤 {e(clip(r['email'], 100))}\n"
-            f"💰 积分: {e(clip(r['points'], 20))} ({e(clip(r['change'], 20))})\n"
-            f"📆 剩余: {e(clip(r['left_days'], 20))} 天\n"
-            f"🎯 签到: {e(clip(r['msg'], 200))}\n"
-            f"🎛 策略: {e(clip(r['plan'], 20))}\n"
-            f"🔁 兑换: {e(clip(r['exchange'], 150))}\n"
-            f"🎁 可兑换选项:\n{e(clip(r['options'], 600))}"
-            "</blockquote>"
-        )
-    # 分块拼接，单条消息不超过 Telegram 4096 字符限制
-    messages, cur = [], header
-    for b in blocks:
-        if cur != header and len(cur) + len(b) + 20 > 3900:
-            messages.append(cur)
-            cur = header
-        cur += "\n\n" + b
-    messages.append(cur)
-    messages[-1] += f"\n\n🕘 {e(cur_time)}"
-    return messages
+    return (
+        "<blockquote expandable>"
+        f"👤 {e(_clip(r['email'], 100))}\n"
+        f"💰 积分: {e(_clip(r['points'], 20))} ({e(_clip(r['change'], 20))})\n"
+        f"📆 剩余: {e(_clip(r['left_days'], 20))} 天\n"
+        f"🎯 签到: {e(_clip(r['msg'], 200))}\n"
+        f"🎛 策略: {e(_clip(r['plan'], 20))}\n"
+        f"🔁 兑换: {e(_clip(r['exchange'], 150))}\n"
+        f"🎁 可兑换选项:\n{e(_clip(r['options'], 600))}"
+        "</blockquote>"
+    )
 
-def telegram_push(token, chat_id, messages):
-    if not token or not chat_id or not messages: return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+def build_report(results, success_cnt, total, cur_time):
+    """生成 [(富文本Markdown, 旧版HTML), ...] 分块消息列表
+    富文本走 sendRichMessage (可折叠 details 区块, 免费无需会员)
+    旧版走 sendMessage HTML 可折叠引用, 作为自动兜底
+    """
+    rich_title = f"# 🚀 GLaDOS 签到 ✅ {success_cnt}/{total}"
+    legacy_title = f"🚀 <b>GLaDOS 签到</b>  ✅ {success_cnt}/{total}"
+    pairs = [(_rich_block(r), _legacy_block(r)) for r in results]
+
+    chunks = []
+    rich_cur, legacy_cur = rich_title, legacy_title
+    for rb, lb in pairs:
+        # 富文本单条上限 32768 字符; 旧版 4096, 留余量分块
+        if len(rich_cur) + len(rb) > 30000 or len(legacy_cur) + len(lb) > 3800:
+            chunks.append((rich_cur, legacy_cur))
+            rich_cur, legacy_cur = rich_title, legacy_title
+        rich_cur += "\n\n" + rb
+        legacy_cur += "\n\n" + lb
+    rich_cur += f"\n\n🕘 {_md(cur_time, 40)}"
+    legacy_cur += f"\n\n🕘 {html.escape(str(cur_time))}"
+    chunks.append((rich_cur, legacy_cur))
+    return chunks
+
+def telegram_push(token, chat_id, chunks):
+    if not token or not chat_id or not chunks: return
+    base = f"https://api.telegram.org/bot{token}"
     sent = 0
-    for m in messages:
+    for rich_md, legacy_html in chunks:
+        ok = False
         try:
-            data = {"chat_id": chat_id, "text": m, "parse_mode": "HTML",
-                    "link_preview_options": {"is_disabled": True}}
-            resp = requests.post(url, json=data, timeout=10)
+            resp = requests.post(f"{base}/sendRichMessage",
+                                 json={"chat_id": chat_id,
+                                       "rich_message": {"markdown": rich_md}},
+                                 timeout=15)
             if resp.status_code == 200:
                 sent += 1
-                continue
-            try: desc = (resp.json() or {}).get('description', '') or ''
-            except Exception: desc = ''
-            if 'parse' in desc.lower():
-                # 兼容兜底: 不支持可折叠引用时退回纯粗体重发
-                plain = re.sub(r'</?blockquote[^>]*>', '', m)
-                requests.post(url, json={"chat_id": chat_id, "text": plain, "parse_mode": "HTML"}, timeout=10)
-                sent += 1
+                ok = True
             else:
-                log(f"❌ Telegram 推送失败: HTTP {resp.status_code} {desc}")
+                try: desc = (resp.json() or {}).get('description', '') or ''
+                except Exception: desc = ''
+                log(f"⚠️ sendRichMessage 失败: HTTP {resp.status_code} {desc}，改用普通格式重发")
         except Exception as e:
-            log(f"❌ Telegram 推送失败: {e}")
-    if sent == len(messages):
-        log(f"✅ Telegram 推送成功 ({sent}/{len(messages)} 条)")
+            log(f"⚠️ sendRichMessage 异常: {e}，改用普通格式重发")
+        if not ok:
+            # 兜底: 旧版 sendMessage + HTML 可折叠引用
+            try:
+                data = {"chat_id": chat_id, "text": legacy_html, "parse_mode": "HTML",
+                        "link_preview_options": {"is_disabled": True}}
+                resp = requests.post(f"{base}/sendMessage", json=data, timeout=10)
+                if resp.status_code == 200:
+                    sent += 1
+                else:
+                    try: desc = (resp.json() or {}).get('description', '') or ''
+                    except Exception: desc = ''
+                    if 'parse' in desc.lower():
+                        plain = re.sub(r'</?blockquote[^>]*>', '', legacy_html)
+                        requests.post(f"{base}/sendMessage",
+                                      json={"chat_id": chat_id, "text": plain}, timeout=10)
+                        sent += 1
+                    else:
+                        log(f"❌ Telegram 推送失败: HTTP {resp.status_code} {desc}")
+            except Exception as e:
+                log(f"❌ Telegram 推送失败: {e}")
+    if sent == len(chunks):
+        log(f"✅ Telegram 推送成功 ({sent}/{len(chunks)} 条)")
 
 # ================= 主程序 =================
 
@@ -288,8 +339,8 @@ def main():
     if tg_token and tg_chat_id:
         # success_cnt 代表今天已完成签到的账号数量
         cur_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        messages = build_report(results, success_cnt, len(cookies), cur_time)
-        telegram_push(tg_token, tg_chat_id, messages)
+        chunks = build_report(results, success_cnt, len(cookies), cur_time)
+        telegram_push(tg_token, tg_chat_id, chunks)
 
 if __name__ == '__main__':
     main()
