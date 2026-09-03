@@ -42,10 +42,28 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 
 | 变量名               | 必填  | 说明                                                                       |
 | -------------------- | ----- | -------------------------------------------------------------------------- |
-| `GLADOS_COOKIE`      | ✅ 是 | GLaDOS 的 Cookie。多个账号请用 `&` 或换行符分隔。                          |
+| `GLADOS_COOKIE`      | ✅ 是 | GLaDOS 的 Cookie。多个账号**一行一个**，每行末尾可用 `#策略` 单独设置兑换（见下文） |
 | `TELEGRAM_BOT_TOKEN` | ❌ 否 | Telegram 机器人的 Token（例如 `123456:ABC-DEF1234...`）                    |
 | `TELEGRAM_CHAT_ID`   | ❌ 否 | 接收推送的 Telegram Chat ID                                                |
-| `GLADOS_EXCHANGE_PLAN`         | ❌ 否 | 配置自动兑换积分策略 plan100 plan200 plan500|
+
+---
+
+### 🎛 多账号分别设置兑换策略
+
+`GLADOS_COOKIE` 中**一行一个账号**，每行末尾可以用 `#` 追加该账号的兑换策略：
+
+```text
+# 以 # 开头的行是注释，可用来标记账号，会被忽略
+koa:sess=账号A的长串; koa:sess.sig=短串A#plan200
+koa:sess=账号B的长串; koa:sess.sig=短串B#off
+koa:sess=账号C的长串; koa:sess.sig=短串C
+```
+
+- 账号 A：积分够 200 时自动兑换 plan200
+- 账号 B：**只签到，永不兑换**
+- 账号 C：行尾未设置策略，只签到不兑换
+
+支持的策略值：`plan100` / `plan200` / `plan500` / `off`（`off` 也可写成 `false`、`0`、`no`、`关闭`）。以 `#` 开头的行视为注释，写错策略名会告警并跳过兑换，不影响签到。
 
 ---
 
@@ -111,7 +129,7 @@ koa:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; koa:sess.sig=abcdef123456
 | `GLADOS_COOKIE`  | 第二步组合的 Cookie      | ✅ 是 |
 | `TELEGRAM_BOT_TOKEN` |  | ❌ 否 |
 | `TELEGRAM_CHAT_ID` |  | ❌ 否 |
-| `GLADOS_EXCHANGE_PLAN` |  | ❌ 否 |
+| `GLADOS_EXCHANGE_PLAN` | ~~已废弃~~ 兑换策略改在 `GLADOS_COOKIE` 每行末尾用 `#策略` 设置 | ❌ 否 |
 ---
 
 
