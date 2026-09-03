@@ -123,13 +123,13 @@ koa:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; koa:sess.sig=abcdef123456
 4. 点击右上角 **New repository secret**
 
 
-添加以下四个 Secret：
+添加以下三个 Secret：
 
 | Name             | Value                    | 必需  |
 | ---------------- | ------------------------ | ----- |
 | `GLADOS_COOKIE`  | 第二步组合的 Cookie      | ✅ 是 |
-| `TELEGRAM_BOT_TOKEN` |  | ❌ 否 |
-| `TELEGRAM_CHAT_ID` |  | ❌ 否 |
+| `TELEGRAM_BOT_TOKEN` | Telegram 机器人的 Token（例如 `123456:ABC-DEF1234...`） | ❌ 否 |
+| `TELEGRAM_CHAT_ID` | 接收推送的 Telegram Chat ID | ❌ 否 |
 ---
 
 
