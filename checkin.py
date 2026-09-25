@@ -277,11 +277,13 @@ def _rich_block(r):
     """单个账号的富文本卡片 (Markdown <details> 可折叠区块)"""
     ok = r.get("ok", False)
     email = _md(r['email'], 80)
-    # 失败账号在标题上就标出 ❌, 避免折叠起来看不出问题
+    # 用 ✅/❌ 直接表示签到结果, 折叠起来也能一眼看出成败
+    icon = "✅" if ok else "❌"
     if ok:
-        summary = f"👤 {email} · 签到成功 · {_md(r['points'], 20)}分 · {_md(r['plan'], 20)}"
+        summary = (f"{icon} {email} · {_md(r['left_days'], 20)}天 · "
+                   f"{_md(r['points'], 20)}分 · {_md(r['plan'], 20)}")
     else:
-        summary = f"❌ {email} · 签到失败"
+        summary = f"{icon} {email} · 签到失败"
     opts = "\n".join("- " + ln for ln in str(r["options"]).splitlines() if ln.strip()) or "- 无"
     body = (
         f"- 🎯 签到: {_md(r['msg'], 200)}\n"
@@ -301,11 +303,12 @@ def _legacy_block(r):
     """单个账号的旧版 HTML 卡片 (可折叠引用, 兜底用)"""
     e = html.escape
     ok = r.get("ok", False)
+    icon = "✅" if ok else "❌"
     if ok:
-        head = (f"👤 {e(_clip(r['email'], 100))} · 签到成功 · "
+        head = (f"{icon} {e(_clip(r['email'], 100))} · {e(_clip(r['left_days'], 20))}天 · "
                 f"{e(_clip(r['points'], 20))}分 · {e(_clip(r['plan'], 20))}")
     else:
-        head = f"❌ {e(_clip(r['email'], 100))} · 签到失败"
+        head = f"{icon} {e(_clip(r['email'], 100))} · 签到失败"
     lines = [
         head,
         f"🎯 签到: {e(_clip(r['msg'], 200))}",
