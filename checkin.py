@@ -26,6 +26,11 @@ PLAN_REQUIREMENTS = {"plan100": 100, "plan200": 200, "plan500": 500}
 CURRENT_SESS = "gld:sess"
 DEPRECATED_SESS = "koa:sess"
 SESS_NAMES = (CURRENT_SESS, DEPRECATED_SESS)
+
+# gld:sess 值形如 gld_ + 48 位小写 hex; gld:sess.sig 为 27 位 base64url
+SESS_PREFIX = "gld_"
+SESS_HEX_LEN = 48
+SIG_MIN_LEN = 20
 # 表示"关闭兑换"的写法
 OFF_VALUES = {"off", "none", "false", "0", "no", "disable", "disabled", "关闭"}
 OFF_PLAN = "off"
@@ -49,6 +54,57 @@ def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
 
+def diagnose_cookie(cookie: str):
+    """本地体检 gld:sess Cookie 格式, 返回问题列表 (空列表 = 格式正常)
+
+    服务端对所有鉴权失败一律返回 code:-2 没有权限, 不区分原因,
+    因此过期/复制不全/格式错误只能靠本地检查给出针对性提示。
+    """
+    issues = []
+    if not cookie:
+        return ["Cookie 为空"]
+
+    # 逐段解析 name=value
+    parts = {}
+    for seg in cookie.split(';'):
+        seg = seg.strip()
+        if '=' in seg:
+            k, v = seg.split('=', 1)
+            parts[k.strip()] = v.strip()
+
+    sess = parts.get(CURRENT_SESS)
+    sig = parts.get(CURRENT_SESS + '.sig')
+
+    if sess is None:
+        issues.append(f"缺少 {CURRENT_SESS}")
+    else:
+        if not sess:
+            issues.append(f"{CURRENT_SESS} 值为空")
+        elif not sess.startswith(SESS_PREFIX):
+            issues.append(
+                f"{CURRENT_SESS} 值不以 '{SESS_PREFIX}' 开头( actual: '{sess[:8]}...'), "
+                f"很可能复制不完整")
+        else:
+            hexpart = sess[len(SESS_PREFIX):]
+            if len(hexpart) != SESS_HEX_LEN:
+                issues.append(
+                    f"{CURRENT_SESS} 长度异常: 期望 {SESS_PREFIX}后 {SESS_HEX_LEN} 位, "
+                    f"实际 {len(hexpart)} 位(差 {len(hexpart) - SESS_HEX_LEN:+d} 位), "
+                    f"多半是复制时漏字符")
+            elif not all(c in '0123456789abcdef' for c in hexpart):
+                issues.append(
+                    f"{CURRENT_SESS} 含非法字符(期望 {SESS_PREFIX}后全是小写 hex "
+                    f"0-9a-f), 复制时可能被截断或混入其它内容")
+
+    if sig is None:
+        issues.append(f"缺少 {CURRENT_SESS}.sig, 服务端会拒绝鉴权")
+    elif len(sig) < SIG_MIN_LEN:
+        issues.append(
+            f"{CURRENT_SESS}.sig 过短({len(sig)} 位, 期望约 27 位), 复制可能不完整")
+
+    return issues
+
+
 def extract_cookie(raw: str):
     """归一化一行 cookie:
     - 已带 gld:sess= -> 原样返回 (需同时带 gld:sess.sig)
@@ -60,9 +116,9 @@ def extract_cookie(raw: str):
     for name in SESS_NAMES:
         if f'{name}=' in raw or f'{name}.sig=' in raw:
             if name == CURRENT_SESS:
-                # 新版 gld:sess 必须同时带 .sig, 否则服务端返回 "No permission"
-                if f'{CURRENT_SESS}.sig=' not in raw:
-                    log(f"⚠️ 该账号缺少 {CURRENT_SESS}.sig, 服务端会拒绝鉴权, 请复制完整 Cookie")
+                # 先做本地格式体检, 给出针对性的复制/失效提示
+                for issue in diagnose_cookie(raw):
+                    log(f"⚠️ {issue}")
             else:
                 log(f"⚠️ 检测到旧版 {DEPRECATED_SESS} Cookie, 站点已改用 {CURRENT_SESS} 并废弃旧格式, "
                     f"该账号签到必然失败; 请重新登录 glados.cloud 复制新的 {CURRENT_SESS} Cookie")
@@ -336,7 +392,13 @@ def main():
         # 因此按 code 判定, 不能匹配 permission 字样
         if code == -2:
             msg = "❌ 鉴权失败: Cookie 无效"
-            hint = f"旧 koa:sess 已被服务端废弃; 请重新登录 glados.cloud 复制 {CURRENT_SESS} + {CURRENT_SESS}.sig"
+            # 服务端不区分原因, 用本地体检结果给出针对性提示
+            diag = diagnose_cookie(cookie)
+            if diag:
+                hint = "格式问题: " + "；".join(diag)
+            else:
+                hint = (f"格式无误, 判定为 Cookie 已过期或失效; "
+                        f"请重新登录 glados.cloud 复制新的 {CURRENT_SESS} + {CURRENT_SESS}.sig")
         # 风控拦截: 需重新登录刷新设备指纹
         elif code == 4:
             msg = "⚠️ 被判定为自动签到"
