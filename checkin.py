@@ -99,12 +99,12 @@ def get_cookies():
         log("❌ 未配置 GLADOS_COOKIE")
         return []
     accounts = []
-    for line in raw.splitlines():
+    for lineno, line in enumerate(raw.splitlines(), 1):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
         cookie, plan = parse_account(line)
-        accounts.append((cookie, plan))
+        accounts.append((cookie, plan, lineno))
     return accounts
 
 # ================= 核心逻辑 =================
@@ -202,32 +202,43 @@ def _legacy(value, limit):
 
 def _rich_block(r):
     """单个账号的富文本卡片 (Markdown <details> 可折叠区块)"""
-    summary = f"👤 {_md(r['email'], 80)} · {_md(r['plan'], 20)} · {_md(r['exchange'], 30)}"
+    ok = r.get("ok", False)
+    email = _md(r['email'], 80)
+    # 失败账号在标题上就标出 ❌, 避免折叠起来看不出问题
+    summary = f"{'❌' if not ok else '👤'} {email} · 签到{'失败' if not ok else '成功'}"
     opts = "\n".join("- " + ln for ln in str(r["options"]).splitlines() if ln.strip()) or "- 无"
     body = (
+        f"- 🎯 签到: {_md(r['msg'], 200)}\n"
         f"- 💰 积分: {_md(r['points'], 20)} ({_md(r['change'], 20)})\n"
         f"- 📆 剩余: {_md(r['left_days'], 20)} 天\n"
-        f"- 🎯 签到: {_md(r['msg'], 200)}\n"
         f"- 🎛 策略: {_md(r['plan'], 20)}\n"
         f"- 🔁 兑换: {_md(r['exchange'], 150)}\n"
-        f"\n**🎁 可兑换选项**\n\n{opts}\n"
     )
+    # 失败时补一行排障提示, 并省略无意义的可兑换选项
+    if not ok:
+        body += f"\n**🔧 排障**: {_md(r['hint'], 200)}\n"
+    else:
+        body += f"\n**🎁 可兑换选项**\n\n{opts}\n"
     return f"<details><summary>{summary}</summary>\n\n{body}\n</details>"
 
 def _legacy_block(r):
     """单个账号的旧版 HTML 卡片 (可折叠引用, 兜底用)"""
     e = html.escape
-    return (
-        "<blockquote expandable>"
-        f"👤 {e(_clip(r['email'], 100))}\n"
-        f"💰 积分: {e(_clip(r['points'], 20))} ({e(_clip(r['change'], 20))})\n"
-        f"📆 剩余: {e(_clip(r['left_days'], 20))} 天\n"
-        f"🎯 签到: {e(_clip(r['msg'], 200))}\n"
-        f"🎛 策略: {e(_clip(r['plan'], 20))}\n"
-        f"🔁 兑换: {e(_clip(r['exchange'], 150))}\n"
-        f"🎁 可兑换选项:\n{e(_clip(r['options'], 600))}"
-        "</blockquote>"
-    )
+    ok = r.get("ok", False)
+    head = f"❌ {e(_clip(r['email'], 100))} · 签到失败" if not ok else f"👤 {e(_clip(r['email'], 100))}"
+    lines = [
+        head,
+        f"🎯 签到: {e(_clip(r['msg'], 200))}",
+        f"💰 积分: {e(_clip(r['points'], 20))} ({e(_clip(r['change'], 20))})",
+        f"📆 剩余: {e(_clip(r['left_days'], 20))} 天",
+        f"🎛 策略: {e(_clip(r['plan'], 20))}",
+        f"🔁 兑换: {e(_clip(r['exchange'], 150))}",
+    ]
+    if not ok:
+        lines.append(f"🔧 排障: {e(_clip(r['hint'], 200))}")
+    else:
+        lines.append(f"🎁 可兑换选项:\n{e(_clip(r['options'], 600))}")
+    return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
 
 def build_report(results, success_cnt, total, cur_time):
     """生成 [(富文本Markdown, 旧版HTML), ...] 分块消息列表
@@ -305,8 +316,10 @@ def main():
     results = []
     success_cnt = 0
     
-    for cookie, plan in cookies:
+    for cookie, plan, lineno in cookies:
         g = GLaDOS(cookie)
+        # 鉴权失败时 email 取不到, 用配置行号定位是哪个账号出问题
+        g.lineno = lineno
         
         checkin_res = g.checkin()
         g.get_status()
@@ -315,16 +328,29 @@ def main():
         # --- 核心判定逻辑修改 ---
         raw_msg = checkin_res.get('message', 'Failure') if checkin_res else "Network Error"
         
-        # 鉴权失败单独识别: 通常是 Cookie 失效/格式废弃, 换域名重试也没用
-        if checkin_res and checkin_res.get('code') == -2 and 'permission' in raw_msg.lower():
-            msg = f"鉴权失败({raw_msg}): Cookie 无效或已是废弃格式, 请重新获取 {CURRENT_SESS}"
+        ok, hint = False, ""
+        code = checkin_res.get('code') if checkin_res else None
+
+        # 鉴权失败: Cookie 失效/格式废弃, 换域名重试也没用
+        # 注意: glados.* 返回中文 "没有权限", 只有 railgun.info 返回 "No permission",
+        # 因此按 code 判定, 不能匹配 permission 字样
+        if code == -2:
+            msg = "❌ 鉴权失败: Cookie 无效"
+            hint = f"旧 koa:sess 已被服务端废弃; 请重新登录 glados.cloud 复制 {CURRENT_SESS} + {CURRENT_SESS}.sig"
+        # 风控拦截: 需重新登录刷新设备指纹
+        elif code == 4:
+            msg = "⚠️ 被判定为自动签到"
+            hint = f"服务端 reason={checkin_res.get('reason')}; 请手动登录一次后再运行"
         # 只要 message 包含 "Checkin" (首次成功) 或 "observation logged" (今日已签到)
         # 都代表今日已经签到成功了，标题显示 1/1
         elif "Checkin" in raw_msg or "observation logged" in raw_msg:
             success_cnt += 1
-            msg = "Today's observation logged. Return tomorrow for more points."
+            ok = True
+            # 区分首次签到与重复签到, 避免每天都显示同一句英文
+            msg = "✅ 签到成功" if "Checkin" in raw_msg else "✅ 今日已签到 (重复提交)"
         else:
-            msg = raw_msg
+            msg = f"❌ {raw_msg}"
+            hint = "接口未返回成功状态, 请检查日志或稍后重试"
 
         current_pts = int(g.points)
         if plan is None:
@@ -344,7 +370,7 @@ def main():
         # 保持要求的全空行排版
         plan_desc = "未设置" if plan is None else ("不兑换" if plan == OFF_PLAN else plan)
         results.append({
-            "email": g.email,
+            "email": g.email if g.email != "?" else f"配置第 {lineno} 行 (Cookie 无效)",
             "points": g.points,
             "change": g.points_change,
             "left_days": g.left_days,
@@ -352,6 +378,8 @@ def main():
             "plan": plan_desc,
             "exchange": exchange_msg,
             "options": g.exchange_info,
+            "ok": ok,
+            "hint": hint,
         })
 
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
