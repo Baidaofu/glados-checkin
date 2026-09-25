@@ -55,9 +55,9 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 
 ```text
 # 以 # 开头的行是注释，可用来标记账号，会被忽略
-koa:sess=账号A的长串; koa:sess.sig=短串A#plan200
-koa:sess=账号B的长串; koa:sess.sig=短串B#off
-koa:sess=账号C的长串; koa:sess.sig=短串C
+gld:sess=账号A的长串; gld:sess.sig=短串A#plan200
+gld:sess=账号B的长串; gld:sess.sig=短串B#off
+gld:sess=账号C的长串; gld:sess.sig=短串C
 ```
 
 - 账号 A：积分够 200 时自动兑换 plan200
@@ -88,8 +88,8 @@ Firefox：存储 → Cookies
 选择 glados.cloud
 复制完整 Cookie 内容
 
-koa:sess=xxxxxx; koa:sess.sig=yyyyyy
-⚠️ 必须是完整的一整段，不要只复制一半
+gld:sess=xxxxxx; gld:sess.sig=yyyyyy
+⚠️ 必须是完整的一整段，**`gld:sess` 和 `gld:sess.sig` 两个都要**，只填 `gld:sess` 会返回 `No permission`
 
 
 
@@ -98,14 +98,17 @@ koa:sess=xxxxxx; koa:sess.sig=yyyyyy
 将两个值按以下格式组合，**注意格式必须完全正确**：
 
 ```text
-koa:sess=你的长字符串; koa:sess.sig=你的短字符串
+gld:sess=你的长字符串; gld:sess.sig=你的短字符串
 ```
 
 **正确示例**：
 
 ```text
-koa:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; koa:sess.sig=abcdef123456
+gld:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; gld:sess.sig=abcdef123456
 ```
+
+> 2026 年起站点签发的 Cookie 名已从 `koa:sess` 改为 **`gld:sess`**。脚本新旧两种都兼容，
+> 老账号填 `koa:sess=...; koa:sess.sig=...` 依然可用；但请优先使用浏览器里实际看到的那一组。
 
 **常见错误**：
 

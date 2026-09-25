@@ -21,6 +21,11 @@ if sys.platform.startswith('win'):
 
 # 兑换档位 -> 所需积分
 PLAN_REQUIREMENTS = {"plan100": 100, "plan200": 200, "plan500": 500}
+
+# 会话 Cookie 名: 新版 gld:sess, 旧版 koa:sess, 两种都兼容
+SESS_NAMES = ("gld:sess", "koa:sess")
+# 裸 token 自动补全时使用的前缀 (当前站点签发的是 gld:sess)
+DEFAULT_SESS = "gld:sess"
 # 表示"关闭兑换"的写法
 OFF_VALUES = {"off", "none", "false", "0", "no", "disable", "disabled", "关闭"}
 OFF_PLAN = "off"
@@ -45,16 +50,24 @@ def log(msg):
     print(f"[{ts}] {msg}")
 
 def extract_cookie(raw: str):
+    """归一化一行 cookie:
+    - 已带 gld:sess= / koa:sess= -> 原样返回 (新旧格式都兼容)
+    - JSON {"token": "..."} 或裸 JWT -> 补 DEFAULT_SESS 前缀
+    """
     if not raw: return None
     raw = raw.strip()
-    if 'koa:sess=' in raw or 'koa:sess.sig=' in raw:
-        return raw
+    for name in SESS_NAMES:
+        if f'{name}=' in raw or f'{name}.sig=' in raw:
+            # 新版 gld:sess 必须同时带 .sig, 否则服务端返回 "No permission"
+            if name == DEFAULT_SESS and f'{DEFAULT_SESS}.sig=' not in raw:
+                log(f"⚠️ 该账号缺少 {DEFAULT_SESS}.sig, 服务端会拒绝鉴权, 请复制完整 Cookie")
+            return raw
     if raw.startswith('{'):
         try:
-            return 'koa.sess=' + json.loads(raw).get('token')
+            return DEFAULT_SESS + '=' + json.loads(raw).get('token')
         except: pass
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
-        return 'koa:sess=' + raw
+        return DEFAULT_SESS + '=' + raw
     return raw
 
 def parse_plan(value):
@@ -70,9 +83,9 @@ def parse_plan(value):
 def parse_account(entry: str):
     """解析一行账号: cookie#策略。行尾无 # 后缀 = 只签到不兑换"""
     if '#' in entry:
-        cookie, plan_raw = entry.rsplit('#', 1)
-        return cookie.strip(), parse_plan(plan_raw)
-    return entry.strip(), None  # None = 未设置兑换策略
+        raw, plan_raw = entry.rsplit('#', 1)
+        return extract_cookie(raw), parse_plan(plan_raw)
+    return extract_cookie(entry), None  # None = 未设置兑换策略
 
 def get_cookies():
     """GLADOS_COOKIE 一行一个账号，# 开头的行视为注释跳过"""
