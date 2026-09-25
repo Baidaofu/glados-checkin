@@ -11,7 +11,13 @@ import sys
 import html
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+    BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:  # 无 tzdata 时退回固定 UTC+8
+    BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 修复 Windows Unicode 输出问题
 if sys.platform.startswith('win'):
@@ -35,6 +41,14 @@ SIG_MIN_LEN = 20
 OFF_VALUES = {"off", "none", "false", "0", "no", "disable", "disabled", "关闭"}
 OFF_PLAN = "off"
 
+
+def plan_label(plan):
+    """展示用策略标签: #off / #plan100 / #plan200 / #plan500
+
+    行尾空着与 #off 行为一致(都只签到不兑换), 统一显示为 #off。
+    """
+    return "#off" if (plan is None or plan == OFF_PLAN) else f"#{plan}"
+
 DOMAINS = [
     "https://glados.cloud",
     "https://railgun.info",
@@ -50,9 +64,12 @@ HEADERS = {
 
 # ================= 工具函数 =================
 
+def now_beijing(fmt="%Y-%m-%d %H:%M:%S"):
+    """北京时间。GitHub Actions runner 是 UTC, 直接用 datetime.now() 会差 8 小时"""
+    return datetime.now(BEIJING_TZ).strftime(fmt)
+
 def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{now_beijing()}] {msg}")
 
 def diagnose_cookie(cookie: str):
     """本地体检 gld:sess Cookie 格式, 返回问题列表 (空列表 = 格式正常)
@@ -261,7 +278,10 @@ def _rich_block(r):
     ok = r.get("ok", False)
     email = _md(r['email'], 80)
     # 失败账号在标题上就标出 ❌, 避免折叠起来看不出问题
-    summary = f"{'❌' if not ok else '👤'} {email} · 签到{'失败' if not ok else '成功'}"
+    if ok:
+        summary = f"👤 {email} · 签到成功 · {_md(r['points'], 20)}分 · {_md(r['plan'], 20)}"
+    else:
+        summary = f"❌ {email} · 签到失败"
     opts = "\n".join("- " + ln for ln in str(r["options"]).splitlines() if ln.strip()) or "- 无"
     body = (
         f"- 🎯 签到: {_md(r['msg'], 200)}\n"
@@ -281,7 +301,11 @@ def _legacy_block(r):
     """单个账号的旧版 HTML 卡片 (可折叠引用, 兜底用)"""
     e = html.escape
     ok = r.get("ok", False)
-    head = f"❌ {e(_clip(r['email'], 100))} · 签到失败" if not ok else f"👤 {e(_clip(r['email'], 100))}"
+    if ok:
+        head = (f"👤 {e(_clip(r['email'], 100))} · 签到成功 · "
+                f"{e(_clip(r['points'], 20))}分 · {e(_clip(r['plan'], 20))}")
+    else:
+        head = f"❌ {e(_clip(r['email'], 100))} · 签到失败"
     lines = [
         head,
         f"🎯 签到: {e(_clip(r['msg'], 200))}",
@@ -429,8 +453,8 @@ def main():
                 g.get_status()
                 g.get_points()
 
-        # 保持要求的全空行排版
-        plan_desc = "未设置" if plan is None else ("不兑换" if plan == OFF_PLAN else plan)
+        # 展示用策略: 空着与 #off 行为一致, 统一显示 #off
+        plan_desc = plan_label(plan)
         results.append({
             "email": g.email if g.email != "?" else f"配置第 {lineno} 行 (Cookie 无效)",
             "points": g.points,
@@ -449,7 +473,7 @@ def main():
     
     if tg_token and tg_chat_id:
         # success_cnt 代表今天已完成签到的账号数量
-        cur_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cur_time = now_beijing('%Y-%m-%d %H:%M:%S') + " (北京时间)"
         chunks = build_report(results, success_cnt, len(cookies), cur_time)
         telegram_push(tg_token, tg_chat_id, chunks)
 
