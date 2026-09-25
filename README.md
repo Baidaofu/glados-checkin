@@ -107,8 +107,11 @@ gld:sess=你的长字符串; gld:sess.sig=你的短字符串
 gld:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; gld:sess.sig=abcdef123456
 ```
 
-> 2026 年起站点签发的 Cookie 名已从 `koa:sess` 改为 **`gld:sess`**。脚本新旧两种都兼容，
-> 老账号填 `koa:sess=...; koa:sess.sig=...` 依然可用；但请优先使用浏览器里实际看到的那一组。
+> ⚠️ 站点签发 Cookie 已从 `koa:sess` 改为 **`gld:sess`**，且**服务端已废弃旧的 koa 格式**：
+> 填 `koa:sess=...; koa:sess.sig=...` 会在所有域名返回 `code:-2 没有权限`，无法签到。
+> 两者不是同一种凭证（koa 是 JWT 明文，gld 是 `gld_<40位hex>` 的库内查询串），**无法本地转换**。
+> 请重新登录 glados.cloud，从 DevTools → Application → Cookies 复制新的 `gld:sess` + `gld:sess.sig`。
+> 脚本检测到旧格式时会打印告警，报错信息里也会提示 `鉴权失败`，方便定位。
 
 **常见错误**：
 

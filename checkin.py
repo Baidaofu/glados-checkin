@@ -22,10 +22,10 @@ if sys.platform.startswith('win'):
 # 兑换档位 -> 所需积分
 PLAN_REQUIREMENTS = {"plan100": 100, "plan200": 200, "plan500": 500}
 
-# 会话 Cookie 名: 新版 gld:sess, 旧版 koa:sess, 两种都兼容
-SESS_NAMES = ("gld:sess", "koa:sess")
-# 裸 token 自动补全时使用的前缀 (当前站点签发的是 gld:sess)
-DEFAULT_SESS = "gld:sess"
+# 会话 Cookie 名: 站点现签发 gld:sess; koa:sess 为旧版, 服务端已废弃
+CURRENT_SESS = "gld:sess"
+DEPRECATED_SESS = "koa:sess"
+SESS_NAMES = (CURRENT_SESS, DEPRECATED_SESS)
 # 表示"关闭兑换"的写法
 OFF_VALUES = {"off", "none", "false", "0", "no", "disable", "disabled", "关闭"}
 OFF_PLAN = "off"
@@ -51,23 +51,28 @@ def log(msg):
 
 def extract_cookie(raw: str):
     """归一化一行 cookie:
-    - 已带 gld:sess= / koa:sess= -> 原样返回 (新旧格式都兼容)
-    - JSON {"token": "..."} 或裸 JWT -> 补 DEFAULT_SESS 前缀
+    - 已带 gld:sess= -> 原样返回 (需同时带 gld:sess.sig)
+    - koa:sess= -> 旧版格式, 服务端已废弃, 告警提示重新获取
+    - JSON {"token": "..."} 或裸 JWT -> 补 CURRENT_SESS 前缀
     """
     if not raw: return None
     raw = raw.strip()
     for name in SESS_NAMES:
         if f'{name}=' in raw or f'{name}.sig=' in raw:
-            # 新版 gld:sess 必须同时带 .sig, 否则服务端返回 "No permission"
-            if name == DEFAULT_SESS and f'{DEFAULT_SESS}.sig=' not in raw:
-                log(f"⚠️ 该账号缺少 {DEFAULT_SESS}.sig, 服务端会拒绝鉴权, 请复制完整 Cookie")
+            if name == CURRENT_SESS:
+                # 新版 gld:sess 必须同时带 .sig, 否则服务端返回 "No permission"
+                if f'{CURRENT_SESS}.sig=' not in raw:
+                    log(f"⚠️ 该账号缺少 {CURRENT_SESS}.sig, 服务端会拒绝鉴权, 请复制完整 Cookie")
+            else:
+                log(f"⚠️ 检测到旧版 {DEPRECATED_SESS} Cookie, 站点已改用 {CURRENT_SESS} 并废弃旧格式, "
+                    f"该账号签到必然失败; 请重新登录 glados.cloud 复制新的 {CURRENT_SESS} Cookie")
             return raw
     if raw.startswith('{'):
         try:
-            return DEFAULT_SESS + '=' + json.loads(raw).get('token')
+            return CURRENT_SESS + '=' + json.loads(raw).get('token')
         except: pass
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
-        return DEFAULT_SESS + '=' + raw
+        return CURRENT_SESS + '=' + raw
     return raw
 
 def parse_plan(value):
@@ -310,9 +315,12 @@ def main():
         # --- 核心判定逻辑修改 ---
         raw_msg = checkin_res.get('message', 'Failure') if checkin_res else "Network Error"
         
+        # 鉴权失败单独识别: 通常是 Cookie 失效/格式废弃, 换域名重试也没用
+        if checkin_res and checkin_res.get('code') == -2 and 'permission' in raw_msg.lower():
+            msg = f"鉴权失败({raw_msg}): Cookie 无效或已是废弃格式, 请重新获取 {CURRENT_SESS}"
         # 只要 message 包含 "Checkin" (首次成功) 或 "observation logged" (今日已签到)
         # 都代表今日已经签到成功了，标题显示 1/1
-        if "Checkin" in raw_msg or "observation logged" in raw_msg:
+        elif "Checkin" in raw_msg or "observation logged" in raw_msg:
             success_cnt += 1
             msg = "Today's observation logged. Return tomorrow for more points."
         else:
