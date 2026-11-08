@@ -259,6 +259,7 @@ class GLaDOS:
         self.left_days = "?"
         self.points = "0"
         self.points_change = "?"
+        self.challenge_ok = None  # None=未尝试 / True=拿到 nonce / False=降级为无 proof 请求
         self.exchange_info = ""
         
     def req(self, method, path, data=None):
@@ -329,8 +330,10 @@ class GLaDOS:
         """
         res = self.req('GET', '/api/user/checkin/challenge')
         if not (isinstance(res, dict) and res.get('code') == 0 and res.get('nonce')):
+            self.challenge_ok = False
             log("⚠️ 未获取到签到 challenge, 服务端可能只发 1 积分 (降权)")
             return {}
+        self.challenge_ok = True
         nonce = str(res['nonce'])
         wait = random.uniform(CHALLENGE_WAIT_MIN, CHALLENGE_WAIT_MAX)
         ttl = res.get('ttl')
@@ -370,63 +373,107 @@ def _legacy(value, limit):
     """HTML 转义并截断"""
     return html.escape(_clip(value, limit))
 
+
+# 三态: 正常签到=绿色对钩 / 检测到异常=黄色警告 / 签到失败=红色叉号
+STATUS_ICON = {"ok": "✅", "warn": "⚠️", "fail": "❌"}
+
+
+def _status(r):
+    """兼容旧结构: 没写 status 的记录按 ok 布尔退化为 ok/fail"""
+    st = r.get("status")
+    if st in STATUS_ICON:
+        return st
+    return "ok" if r.get("ok") else "fail"
+
+
+def _warn_tag(r):
+    """折叠状态下也能看到的异常短标签"""
+    reasons = r.get("reasons") or []
+    return reasons[0] if reasons else "疑似异常"
+
 def _rich_block(r):
     """单个账号的富文本卡片 (Markdown <details> 可折叠区块)"""
-    ok = r.get("ok", False)
+    st = _status(r)
+    icon = STATUS_ICON[st]
     email = _md(r['email'], 80)
-    # 用 ✅/❌ 直接表示签到结果, 折叠起来也能一眼看出成败
-    icon = "✅" if ok else "❌"
-    if ok:
+    # 用图标直接表示结果, 折叠起来也能一眼看出正常/异常/失败
+    if st == "fail":
+        summary = f"{icon} {email} · 签到失败"
+    else:
         summary = (f"{icon} {email} · {_md(r['left_days'], 20)}天 · "
                    f"{_md(r['points'], 20)}分 · {_md(r['plan'], 20)}")
-    else:
-        summary = f"{icon} {email} · 签到失败"
+        if st == "warn":
+            summary += f" · {_md(_warn_tag(r), 40)}"
     opts = "\n".join("- " + ln for ln in str(r["options"]).splitlines() if ln.strip()) or "- 无"
     body = (
-        f"- 🎯 签到: {_md(r['msg'], 200)}\n"
+        f"- 🎯 签到: {icon} {_md(r['msg'], 200)}\n"
         f"- 💰 积分: {_md(r['points'], 20)} ({_md(r['change'], 20)})\n"
         f"- 📆 剩余: {_md(r['left_days'], 20)} 天\n"
         f"- 🎛 策略: {_md(r['plan'], 20)}\n"
         f"- 🔁 兑换: {_md(r['exchange'], 150)}\n"
     )
-    # 失败时补一行排障提示, 并省略无意义的可兑换选项
-    if not ok:
+    # 失败: 补排障提示，省略无意义的可兑换选项
+    if st == "fail":
         body += f"\n**🔧 排障**: {_md(r['hint'], 200)}\n"
     else:
+        # 异常(如降权): 也给出原因，但保留可兑换选项
+        if st == "warn" and r.get("hint"):
+            body += f"\n**🔧 提示**: {_md(r['hint'], 200)}\n"
         body += f"\n**🎁 可兑换选项**\n\n{opts}\n"
     return f"<details><summary>{summary}</summary>\n\n{body}\n</details>"
 
 def _legacy_block(r):
     """单个账号的旧版 HTML 卡片 (可折叠引用, 兜底用)"""
     e = html.escape
-    ok = r.get("ok", False)
-    icon = "✅" if ok else "❌"
-    if ok:
+    st = _status(r)
+    icon = STATUS_ICON[st]
+    if st == "fail":
+        head = f"{icon} {e(_clip(r['email'], 100))} · 签到失败"
+    else:
         head = (f"{icon} {e(_clip(r['email'], 100))} · {e(_clip(r['left_days'], 20))}天 · "
                 f"{e(_clip(r['points'], 20))}分 · {e(_clip(r['plan'], 20))}")
-    else:
-        head = f"{icon} {e(_clip(r['email'], 100))} · 签到失败"
+        if st == "warn":
+            head += f" · {e(_clip(_warn_tag(r), 40))}"
     lines = [
         head,
-        f"🎯 签到: {e(_clip(r['msg'], 200))}",
+        f"🎯 签到: {icon} {e(_clip(r['msg'], 200))}",
         f"💰 积分: {e(_clip(r['points'], 20))} ({e(_clip(r['change'], 20))})",
         f"📆 剩余: {e(_clip(r['left_days'], 20))} 天",
         f"🎛 策略: {e(_clip(r['plan'], 20))}",
         f"🔁 兑换: {e(_clip(r['exchange'], 150))}",
     ]
-    if not ok:
+    if st == "fail":
         lines.append(f"🔧 排障: {e(_clip(r['hint'], 200))}")
     else:
+        if st == "warn" and r.get("hint"):
+            lines.append(f"🔧 提示: {e(_clip(r['hint'], 200))}")
         lines.append(f"🎁 可兑换选项:\n{e(_clip(r['options'], 600))}")
     return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
+
+def _points_delta(value):
+    """把 "+10"/"-1"/"1.5" 这类积分变化转成 float, 解析失败返回 None"""
+    try:
+        return float(str(value).strip().lstrip('+'))
+    except (TypeError, ValueError):
+        return None
+
 
 def build_report(results, success_cnt, total, cur_time):
     """生成 [(富文本Markdown, 旧版HTML), ...] 分块消息列表
     富文本走 sendRichMessage (可折叠 details 区块, 免费无需会员)
     旧版走 sendMessage HTML 可折叠引用, 作为自动兜底
     """
-    rich_title = f"# 🚀 GLaDOS 签到 ✅ {success_cnt}/{total}"
-    legacy_title = f"🚀 <b>GLaDOS 签到</b>  ✅ {success_cnt}/{total}"
+    n_ok = sum(1 for r in results if _status(r) == "ok")
+    n_warn = sum(1 for r in results if _status(r) == "warn")
+    n_fail = sum(1 for r in results if _status(r) == "fail")
+    if n_warn or n_fail:
+        # 有异常/失败时把三态分开报, 避免 ⚠️ 被算进 ✅ 里看不清
+        rich_title = f"# 🚀 GLaDOS 签到 ✅ {n_ok} · ⚠️ {n_warn} · ❌ {n_fail}"
+        legacy_title = (f"🚀 <b>GLaDOS 签到</b>  ✅ {n_ok} · "
+                        f"⚠️ {n_warn} · ❌ {n_fail}")
+    else:
+        rich_title = f"# 🚀 GLaDOS 签到 ✅ {n_ok}/{total}"
+        legacy_title = f"🚀 <b>GLaDOS 签到</b>  ✅ {n_ok}/{total}"
     pairs = [(_rich_block(r), _legacy_block(r)) for r in results]
 
     chunks = []
@@ -523,13 +570,15 @@ def main():
         raw_msg = checkin_res.get('message', 'Failure') if checkin_res else "Network Error"
         
         ok, hint = False, ""
+        warn = False
+        reasons = []
         code = checkin_res.get('code') if checkin_res else None
 
         # 鉴权失败: Cookie 失效/格式废弃, 换域名重试也没用
         # 注意: glados.* 返回中文 "没有权限", 只有 railgun.info 返回 "No permission",
         # 因此按 code 判定, 不能匹配 permission 字样
         if code == -2:
-            msg = "❌ 鉴权失败: Cookie 无效"
+            msg = "鉴权失败: Cookie 无效"
             # 服务端不区分原因, 用本地体检结果给出针对性提示
             diag = diagnose_cookie(cookie)
             if diag:
@@ -539,20 +588,36 @@ def main():
                         f"请重新登录 glados.cloud 复制新的 {CURRENT_SESS} + {CURRENT_SESS}.sig")
         # 风控拦截: 需重新登录刷新设备指纹
         elif code == 4:
-            msg = "⚠️ 被判定为自动签到"
+            msg = "被判定为自动签到"
             hint = f"服务端 reason={checkin_res.get('reason')}; 请手动登录一次后再运行"
         # 只要 message 包含 "Checkin" (首次成功) 或 "observation logged" (今日已签到)
         # 都代表今日已经签到成功了，标题显示 1/1
-        elif "Checkin" in raw_msg or "observation logged" in raw_msg:
+        elif ("checkin" in raw_msg.lower()
+              or "observation logged" in raw_msg.lower()):
             success_cnt += 1
             ok = True
-            # 区分首次签到与重复签到, 避免每天都显示同一句英文
-            msg = "✅ 签到成功" if "Checkin" in raw_msg else "✅ 今日已签到 (重复提交)"
+            # 区分首次签到与重复签到, 避免每天都显示同一句英文。
+            # 服务端文案大小写/版本不统一("Checkin! got X Points" / "checkin repeats! please try tomorrow"
+            # / "today's observation logged"), 统一转小写判断, 首次的特征是带 "got" 且不带 "repeat"
+            low = raw_msg.lower()
+            first = "got" in low and "repeat" not in low
+            msg = "签到成功" if first else "今日已签到 (重复提交)"
             # 降权自检: 正常签到 >= 10 分, 只加 1 分说明 challenge/proof 没通过
-            if g.points_change.lstrip('+').isdigit() and int(g.points_change.lstrip('+')) <= 1:
-                msg += " (⚠️ 仅 +1 分, 疑似降权)"
+            # 负数变化是兑换/调整, 不是签到降权; 只有 0~1 分才算"没拿到正常签到积分"
+            delta = _points_delta(g.points_change)
+            if delta is not None and 0 <= delta <= 1:
+                warn = True
+                reasons.append(f"仅 +{delta:g} 分, 疑似降权")
+            # challenge 没拿到就发了降级请求 → 即使这次没降权也要提醒
+            if g.challenge_ok is False:
+                warn = True
+                reasons.append("未获取到 challenge, 已降级请求")
+            if warn:
+                msg += " — " + "；".join(reasons)
+                hint = ("本次签到被服务端降权/走降级请求: 检查日志里有没有 "
+                        "🔐 challenge 那行; 如果一直 +1 分, 该账号可能被风控, 建议手动登录一次或换 UA")
         else:
-            msg = f"❌ {raw_msg}"
+            msg = f"{raw_msg}"
             hint = "接口未返回成功状态, 请检查日志或稍后重试"
 
         current_pts = int(g.points)
@@ -582,6 +647,9 @@ def main():
             "exchange": exchange_msg,
             "options": g.exchange_info,
             "ok": ok,
+            "warn": warn,
+            "status": "fail" if not ok else ("warn" if warn else "ok"),
+            "reasons": reasons,
             "hint": hint,
             "lineno": lineno,
         })
