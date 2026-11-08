@@ -4,6 +4,7 @@
 2026 GLaDOS 自动签到 (多账号独立兑换策略 - GLADOS_COOKIE 一行一个账号)
 """
 
+import hashlib
 import requests
 import json
 import os
@@ -49,6 +50,12 @@ def plan_label(plan):
     """
     return "#off" if (plan is None or plan == OFF_PLAN) else f"#{plan}"
 
+# 2026 签到风控: 服务端要求先 GET /api/user/checkin/challenge 拿 nonce,
+# 距签发 >= 2500ms 后用固定盐算 SHA-256(nonce + ".glados-observe-v1") 作为 proof 一起提交。
+# 不提交 challenge/proof 时接口照样返回成功, 但只发 1 积分(降权)。
+CHALLENGE_SALT = "glados-observe-v1"
+CHALLENGE_MIN_WAIT_SECONDS = 2.6
+
 DOMAINS = [
     "https://glados.cloud",
     "https://railgun.info",
@@ -70,6 +77,13 @@ def now_beijing(fmt="%Y-%m-%d %H:%M:%S"):
 
 def log(msg):
     print(f"[{now_beijing()}] {msg}")
+
+
+def checkin_proof(nonce: str) -> str:
+    """前端 630 模块 checkinProof: hex(sha256(nonce + "." + 固定盐))"""
+    if not nonce:
+        return ""
+    return hashlib.sha256(f"{nonce}.{CHALLENGE_SALT}".encode("utf-8")).hexdigest()
 
 def diagnose_cookie(cookie: str):
     """本地体检 gld:sess Cookie 格式, 返回问题列表 (空列表 = 格式正常)
@@ -250,8 +264,30 @@ class GLaDOS:
             return True
         return False
 
+    def solve_challenge(self):
+        """取签到 challenge 并在累计等待够 CHALLENGE_MIN_WAIT_SECONDS 后返回 nonce/proof
+
+        前端 solveChallenge 是"距 challenge 签发满 2500ms 才提交", 这里在拿到响应后
+        再等满 2.6s (含网络耗时, 服务端看到的时间差必然 >= 2.5s);
+        ttl 默认 300s, 多等这 2.6s 不会过期。
+        """
+        res = self.req('GET', '/api/user/checkin/challenge')
+        if not (isinstance(res, dict) and res.get('code') == 0 and res.get('nonce')):
+            log("⚠️ 未获取到签到 challenge, 服务端可能只发 1 积分 (降权)")
+            return {}
+        nonce = str(res['nonce'])
+        time.sleep(CHALLENGE_MIN_WAIT_SECONDS)
+        log(f"🔐 challenge nonce={nonce[:8]}… 已等待 {CHALLENGE_MIN_WAIT_SECONDS}s, 提交 proof")
+        return {'nonce': nonce, 'proof': checkin_proof(nonce)}
+
     def checkin(self):
-        return self.req('POST', '/api/user/checkin', {'token': 'glados.cloud'})
+        payload = {'token': 'glados.cloud'}
+        challenge = self.solve_challenge()
+        if challenge:
+            # challenge 与签到必须在同一域名签发, 否则 nonce 校验不过
+            payload['token'] = self.domain.split('//')[-1].strip('/') or 'glados.cloud'
+            payload.update(challenge)
+        return self.req('POST', '/api/user/checkin', payload)
 
     def exchange(self, plan):
         return self.req('POST', '/api/user/exchange', {'planType': plan})
@@ -437,6 +473,9 @@ def main():
             ok = True
             # 区分首次签到与重复签到, 避免每天都显示同一句英文
             msg = "✅ 签到成功" if "Checkin" in raw_msg else "✅ 今日已签到 (重复提交)"
+            # 降权自检: 正常签到 >= 10 分, 只加 1 分说明 challenge/proof 没通过
+            if g.points_change.lstrip('+').isdigit() and int(g.points_change.lstrip('+')) <= 1:
+                msg += " (⚠️ 仅 +1 分, 疑似降权)"
         else:
             msg = f"❌ {raw_msg}"
             hint = "接口未返回成功状态, 请检查日志或稍后重试"

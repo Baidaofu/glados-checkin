@@ -22,6 +22,8 @@
 ---
 ## 💡 重要说明
 GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动触发，使用 **cron-job.org**（免费服务）来触发签到。
+
+> **2026-11 签到降权说明**：GLaDOS 新增签到风控，必须先 `GET /api/user/checkin/challenge` 拿 `nonce`，距签发 ≥2500ms 后用固定盐 `glados-observe-v1` 计算 `SHA-256(nonce + ".glados-observe-v1")` 作为 `proof` 一并提交。缺 `nonce`/`proof` 时接口仍返回成功，但只发 **1 积分**。本仓库已在 `checkin.py` 中实现完整流程，日志里会打印 `🔐 challenge nonce=…`。
 >
 >
 >
