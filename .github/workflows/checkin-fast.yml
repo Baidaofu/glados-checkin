@@ -1,15 +1,16 @@
 name: GLaDOS Checkin (Fast)
 
-# 快速验证代码改动: 与 GLaDOS  Checkin 完全一致, 但没有随机等待和重试等待,
-# 用于手动触发后立即看到结果。注意: 签到/兑换都是真实操作, 会真实扣分。
+# 快速验证代码改动: 与 GLaDOS  Checkin 完全一致, 但没有启动前的 30 分钟随机等待和失败重试,
+# 用于手动触发后尽快看到结果(脚本内仍保留每账号 challenge 随机等待与账号间隔)。
+# 注意: 签到/兑换都是真实操作, 会真实扣分。
 on:
   workflow_dispatch:  # 仅手动触发, 不参与定时调度
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    # 无需等待, 5 分钟足够
-    timeout-minutes: 5
+    # 多账号有随机间隔(默认 8~35s/账号) + 每账号随机等待(2.8~9s), 留足余量
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -26,7 +27,7 @@ jobs:
 
       - name: Run Checkin
         run: python checkin.py
-        timeout-minutes: 5
+        timeout-minutes: 25
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}

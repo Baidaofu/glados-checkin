@@ -6,8 +6,8 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    # 随机等待 30 分钟，总超时设为 50 分钟足够了
-    timeout-minutes: 50
+    # 随机等待最多 30 分钟 + 脚本内多账号随机间隔, 总超时留到 60 分钟
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -31,7 +31,7 @@ jobs:
 
       - name: Run Checkin
         run: python checkin.py
-        timeout-minutes: 5
+        timeout-minutes: 25
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
@@ -44,7 +44,7 @@ jobs:
           echo "First attempt failed, retrying in 60s..."
           sleep 60
           python checkin.py
-        timeout-minutes: 5
+        timeout-minutes: 25
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}

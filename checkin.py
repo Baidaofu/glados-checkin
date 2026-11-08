@@ -5,6 +5,7 @@
 """
 
 import hashlib
+import random
 import requests
 import json
 import os
@@ -54,7 +55,31 @@ def plan_label(plan):
 # 距签发 >= 2500ms 后用固定盐算 SHA-256(nonce + ".glados-observe-v1") 作为 proof 一起提交。
 # 不提交 challenge/proof 时接口照样返回成功, 但只发 1 积分(降权)。
 CHALLENGE_SALT = "glados-observe-v1"
-CHALLENGE_MIN_WAIT_SECONDS = 2.6
+# 服务端硬门槛 2500ms, 前端自己也补到 2500ms, 这里作为绝对下限
+CHALLENGE_WAIT_FLOOR = 2.5
+
+
+def _env_float(name, default):
+    """读浮点环境变量, 非法值回退默认(此时 log() 还没定义, 用 print)"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[config] 环境变量 {name}='{raw}' 不是数字, 使用默认值 {default}")
+        return default
+
+
+# 每个账号拿到 challenge 后随机等待的区间(秒)。
+# 同一时刻批量签到最容易被打上"多账号同源"标签, 抖动越大越像散落的真人操作。
+# 想压到最短就设 2.6/2.8; 想让间隔更像人, 把 MAX 拉到 15~30 也完全没问题(challenge ttl 默认 300s)。
+CHALLENGE_WAIT_MIN = max(CHALLENGE_WAIT_FLOOR, _env_float("GLADOS_CHALLENGE_WAIT_MIN", 2.8))
+CHALLENGE_WAIT_MAX = max(CHALLENGE_WAIT_MIN, _env_float("GLADOS_CHALLENGE_WAIT_MAX", 9.0))
+
+# 相邻两个账号之间的随机间隔(秒), 避免多账号在同一秒内连刷
+ACCOUNT_GAP_MIN = max(0.0, _env_float("GLADOS_ACCOUNT_GAP_MIN", 8.0))
+ACCOUNT_GAP_MAX = max(ACCOUNT_GAP_MIN, _env_float("GLADOS_ACCOUNT_GAP_MAX", 35.0))
 
 DOMAINS = [
     "https://glados.cloud",
@@ -63,8 +88,29 @@ DOMAINS = [
     "https://glados.network",
 ]
 
+DEFAULT_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/120.0.0.0 Safari/537.36')
+
+# 多账号防关联: 每个账号固定一个 UA, 由 cookie 哈希决定。
+# 为什么不用每次随机: 同一个账号 UA 每次变会直接触发码农风的 device-mismatch 校验;
+# 固定但"账号间互不相同"既能打散指纹, 又不会踩风控。
+# 全部保持 Windows + Chromium 家族, 和原来能正常签到的 UA 同类, 风险最低。
+UA_POOL = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+]
+# 设 GLADOS_UA_ROTATE=0 可退回所有人统一用 DEFAULT_USER_AGENT
+UA_ROTATE = os.environ.get("GLADOS_UA_ROTATE", "1").strip().lower() not in OFF_VALUES
+
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': DEFAULT_USER_AGENT,
     'Content-Type': 'application/json;charset=UTF-8',
     'Accept': 'application/json, text/plain, */*',
 }
@@ -84,6 +130,14 @@ def checkin_proof(nonce: str) -> str:
     if not nonce:
         return ""
     return hashlib.sha256(f"{nonce}.{CHALLENGE_SALT}".encode("utf-8")).hexdigest()
+
+
+def pick_ua(cookie: str) -> str:
+    """按 cookie 哈希固定选 UA: 同账号跨运行永远一致, 不同账号彼此不同"""
+    if not UA_ROTATE:
+        return DEFAULT_USER_AGENT
+    digest = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+    return UA_POOL[int(digest[:8], 16) % len(UA_POOL)]
 
 def diagnose_cookie(cookie: str):
     """本地体检 gld:sess Cookie 格式, 返回问题列表 (空列表 = 格式正常)
@@ -197,8 +251,9 @@ def get_cookies():
 # ================= 核心逻辑 =================
 
 class GLaDOS:
-    def __init__(self, cookie):
+    def __init__(self, cookie, ua=None):
         self.cookie = cookie
+        self.ua = ua or pick_ua(cookie)
         self.domain = DOMAINS[0]
         self.email = "?"
         self.left_days = "?"
@@ -211,6 +266,7 @@ class GLaDOS:
             try:
                 url = f"{d}{path}"
                 h = HEADERS.copy()
+                h['User-Agent'] = self.ua
                 h['Cookie'] = self.cookie
                 h['Origin'] = d
                 h['Referer'] = f"{d}/console/checkin"
@@ -265,19 +321,24 @@ class GLaDOS:
         return False
 
     def solve_challenge(self):
-        """取签到 challenge 并在累计等待够 CHALLENGE_MIN_WAIT_SECONDS 后返回 nonce/proof
+        """取签到 challenge, 随机等待后返回 nonce/proof
 
-        前端 solveChallenge 是"距 challenge 签发满 2500ms 才提交", 这里在拿到响应后
-        再等满 2.6s (含网络耗时, 服务端看到的时间差必然 >= 2.5s);
-        ttl 默认 300s, 多等这 2.6s 不会过期。
+        前端 solveChallenge: 距 challenge 签发满 2500ms 才提交。这里在拿到响应后
+        随机等 CHALLENGE_WAIT_MIN~MAX 秒(下限已钳到 2.5s), 含网络耗时服务端看到的时间差
+        必然达标; 实际等待会再按服务端返回的 ttl 钳一次, 不会等到 nonce 过期。
         """
         res = self.req('GET', '/api/user/checkin/challenge')
         if not (isinstance(res, dict) and res.get('code') == 0 and res.get('nonce')):
             log("⚠️ 未获取到签到 challenge, 服务端可能只发 1 积分 (降权)")
             return {}
         nonce = str(res['nonce'])
-        time.sleep(CHALLENGE_MIN_WAIT_SECONDS)
-        log(f"🔐 challenge nonce={nonce[:8]}… 已等待 {CHALLENGE_MIN_WAIT_SECONDS}s, 提交 proof")
+        wait = random.uniform(CHALLENGE_WAIT_MIN, CHALLENGE_WAIT_MAX)
+        ttl = res.get('ttl')
+        if isinstance(ttl, (int, float)) and ttl > 0:
+            # 前端同样留 15s 余量后再判过期
+            wait = min(wait, max(CHALLENGE_WAIT_FLOOR, ttl / 1000.0 - 15))
+        time.sleep(wait)
+        log(f"🔐 challenge nonce={nonce[:8]}… 随机等待 {wait:.1f}s 后提交 proof")
         return {'nonce': nonce, 'proof': checkin_proof(nonce)}
 
     def checkin(self):
@@ -434,9 +495,23 @@ def main():
     
     results = []
     success_cnt = 0
-    
-    for cookie, plan, lineno in cookies:
-        g = GLaDOS(cookie)
+
+    # 打乱执行顺序: 固定顺序 + 固定时间间隔是多账号关联最明显的特征。
+    # 推送里再按配置行号还原顺序, 不影响阅读。
+    order = list(range(len(cookies)))
+    random.shuffle(order)
+    if len(cookies) > 1:
+        log(f"🎲 本次执行顺序: {[cookies[i][2] for i in order]} (配置行号)")
+
+    for pos, idx in enumerate(order):
+        cookie, plan, lineno = cookies[idx]
+        if pos:
+            gap = random.uniform(ACCOUNT_GAP_MIN, ACCOUNT_GAP_MAX)
+            log(f"⏳ 账号之间随机间隔 {gap:.1f}s")
+            time.sleep(gap)
+
+        # 可选: GLADOS_USER_AGENT_<行号> 强制指定某账号 UA(填浏览器里真实的 UA 可规避 device-mismatch)
+        g = GLaDOS(cookie, ua=os.environ.get(f"GLADOS_USER_AGENT_{lineno}") or None)
         # 鉴权失败时 email 取不到, 用配置行号定位是哪个账号出问题
         g.lineno = lineno
         
@@ -508,7 +583,11 @@ def main():
             "options": g.exchange_info,
             "ok": ok,
             "hint": hint,
+            "lineno": lineno,
         })
+
+    # 执行顺序被打乱过, 推送前按配置行号还原
+    results.sort(key=lambda r: r["lineno"])
 
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")

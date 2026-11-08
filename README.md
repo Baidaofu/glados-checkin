@@ -48,6 +48,13 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 | `GLADOS_COOKIE`      | ✅ 是 | GLaDOS 的 Cookie。多个账号**一行一个**，每行末尾可用 `#策略` 单独设置兑换（见下文） |
 | `TELEGRAM_BOT_TOKEN` | ❌ 否 | Telegram 机器人的 Token（例如 `123456:ABC-DEF1234...`）                    |
 | `TELEGRAM_CHAT_ID`   | ❌ 否 | 接收推送的 Telegram Chat ID                                                |
+| `GLADOS_CHALLENGE_WAIT_MIN` / `_MAX` | ❌ 否 | 每个账号拿到 challenge 后的**随机**等待区间（秒），默认 `2.8`~`9.0`，下限被强制钳到 2.5s |
+| `GLADOS_ACCOUNT_GAP_MIN` / `_MAX`    | ❌ 否 | 相邻账号之间的随机间隔（秒），默认 `8`~`35`，多账号靠它拉开时间 |
+| `GLADOS_UA_ROTATE`   | ❌ 否 | `1`（默认）按账号固定分配不同 UA；`0` 全部退回同一 UA |
+| `GLADOS_USER_AGENT_<行号>` | ❌ 否 | 强制指定某一行账号的 UA，如 `GLADOS_USER_AGENT_2`，用于修 `device-mismatch` |
+
+> 多账号反关联策略：**执行顺序每次随机打乱**（推送仍按配置行号排序）+ 账号间随机间隔 + 每账号固定不同 UA（按 Cookie 哈希决定，同账号跨运行不变，避免 device-mismatch）。
+> 若日志出现 `code=4` / `device-mismatch`，说明该账号登录时的设备指纹和脚本不一致，用 `GLADOS_USER_AGENT_<行号>` 填浏览器里真实的 UA 即可，或临时 `GLADOS_UA_ROTATE=0`。
 
 ---
 
