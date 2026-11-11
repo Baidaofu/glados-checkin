@@ -24,7 +24,8 @@
 GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动触发，使用 **cron-job.org**（免费服务）来触发签到。
 
 > **签到分怎么算的**：签到分 = 基础分（服务端决定）+ 套餐加成（Pro +1 / Team +1.5 / Enterprise +2）+ 连签加成（>7 天 +1 / >14 天 +2）+ 线缆质量加成（按 IQI 分数 +1~+8）。
-> 所以 **+1** 通常代表 challenge/proof 没通过、只发了基础分；**+2** 多半是「基础分 1 + 线缆 1」（免费套餐、连签不足 8 天、IQI 分数偏高），不一定是异常。设 `GLADOS_DEBUG=1` 可以看到 `🧮 加分构成: 套餐 … · 连签 … · 线缆 …` 和近 14 天趋势，对比历史就知道是否被降权。
+> 所以 **+1** 通常代表 challenge/proof 没通过、只发了基础分；**+2/+3** 有可能正常（免费套餐 + 连签不足 + 线缆最低档），也可能是**线缆分没拿到**（当天还没有质量测量记录、Cookie 与请求域名不一致、刚重新登录的会话等），不能只看数字下结论。
+> 设 `GLADOS_DEBUG=1` 会打印 `🧮 加分构成: 套餐 … · 连签 … · 线缆 … (服务端 cablePoints=…) · 质量测量于 …` 和近 14 天积分趋势，和以前正常的日子对比就知道有没有被降权。
 >
 > **2026-11 签到降权说明**：GLaDOS 新增签到风控，必须先 `GET /api/user/checkin/challenge` 拿 `nonce`，距签发 ≥2500ms 后用固定盐 `glados-observe-v1` 计算 `SHA-256(nonce + ".glados-observe-v1")` 作为 `proof` 一并提交。缺 `nonce`/`proof` 时接口仍返回成功，但只发 **1 积分**。本仓库已在 `checkin.py` 中实现完整流程，日志里会打印 `🔐 challenge nonce=…`。
 >
@@ -51,7 +52,7 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 
 | 变量名               | 必填  | 说明                                                                       |
 | -------------------- | ----- | -------------------------------------------------------------------------- |
-| `GLADOS_COOKIE`      | ✅ 是 | GLaDOS 的 Cookie。多个账号**一行一个**，每行末尾可用 `#策略` 单独设置兑换（见下文） |
+| `GLADOS_COOKIE`      | ✅ 是 | GLaDOS 的 Cookie。支持 **Cookie-Editor 完整 JSON**（推荐，自动带域名）或请求头格式；多个账号**一行一个**，行尾可加 `#策略` |
 | `TELEGRAM_BOT_TOKEN` | ❌ 否 | Telegram 机器人的 Token（例如 `123456:ABC-DEF1234...`）                    |
 | `TELEGRAM_CHAT_ID`   | ❌ 否 | 接收推送的 Telegram Chat ID                                                |
 | `GLADOS_CHALLENGE_WAIT_MIN` / `_MAX` | ❌ 否 | 每个账号拿到 challenge 后的**随机**等待区间（秒），默认 `2.8`~`9.0`，下限被强制钳到 2.5s |
@@ -89,7 +90,15 @@ plan100
 
 ### 🎛 多账号分别设置兑换策略
 
-`GLADOS_COOKIE` 中**一行一个账号**，每行末尾可以用 `#` 追加该账号的兑换策略：
+两种写法，**Cookie 行内 > `GLADOS_PLANS` > 都不写（只签到不兑换）**：
+
+| 来源 | 写法 | 优先级 |
+| --- | --- | --- |
+| Cookie 行尾 | `...gld:sess.sig=xxx#plan200` | 最高 |
+| `GLADOS_PLANS` | 一行一个策略，按账号顺序对应 | 次之 |
+| 都不写 | 只签到，不自动兑换 | — |
+
+#### 写法一：Cookie 行尾 `#策略`
 
 ```text
 # 以 # 开头的行是注释，可用来标记账号，会被忽略
@@ -102,7 +111,40 @@ gld:sess=账号C的长串; gld:sess.sig=短串C
 - 账号 B：**只签到，永不兑换**
 - 账号 C：行尾未设置策略，只签到不兑换
 
-支持的策略值：`plan100` / `plan200` / `plan500` / `off`（`off` 也可写成 `false`、`0`、`no`、`关闭`）。以 `#` 开头的行视为注释，写错策略名会告警并跳过兑换，不影响签到。
+#### 写法二：`GLADOS_PLANS`（多账号推荐）
+
+现在一个账号的 Cookie 有 4 段（`gld:sess` / `.sig` / `gld:accts` / `.sig`），在行尾再加 `#plan200` 不好核对。
+可以把策略单独放进 Secret `GLADOS_PLANS`，**一行一个，按 `GLADOS_COOKIE` 里账号的先后顺序对应**：
+
+```text
+off
+off
+plan200
+off
+plan100
+```
+
+- 第 1 行 → 第 1 个账号，第 2 行 → 第 2 个账号，依此类推
+- **空行也占一个位置**，表示该账号不设置策略（沿用行内策略；行内也没有就只签到）
+- `#` 开头的行是注释，**不占位置**
+- 行内 `#planXXX` 和 `GLADOS_PLANS` 冲突时，**以行内为准**
+- 账号执行顺序每次都会随机打乱，但策略在解析阶段就绑定到账号上了，**不会串号**；推送仍按配置行号排序
+
+优先级示例：
+
+```text
+# GLADOS_COOKIE 第 1 行行尾是 #plan500
+GLADOS_PLANS 第 1 行是 off
+→ 实际执行 plan500（行内优先）
+```
+
+日志里能看到每个账号最终采用的策略：
+
+```text
+🎛 第 3 个账号(配置第 3 行)使用 GLADOS_PLANS 策略: plan200
+```
+
+支持的策略值：`plan100` / `plan200` / `plan500` / `off`（`off` 也可写成 `false`、`0`、`no`、`关闭`）。写错策略名会告警并按"不兑换"处理，不影响签到。
 
 ---
 
@@ -118,15 +160,16 @@ gld:sess=账号C的长串; gld:sess.sig=短串C
 
 ### 第二步：获取 Cookie 🍪
 
-打开浏览器，登录：https://glados.cloud
-按 F12 打开开发者工具
-找到：
-Chrome：Application → Cookies
-Firefox：存储 → Cookies
-选择 glados.cloud
-复制完整 Cookie 内容
+打开浏览器，登录：**https://glados.network**
+（`glados.cloud` / `glados.rocks` / `railgun.info` 也可以，脚本会按 Cookie 所属域名优先请求，默认也是 `glados.network`）
 
-gld:sess=xxxxxx; gld:sess.sig=yyyyyy
+按 F12 打开开发者工具 → **Application → Cookies**（Firefox：存储 → Cookies）
+选择你登录的那个域名（如 `glados.network`），复制完整 Cookie 内容
+
+```text
+gld:sess=xxxxxx; gld:sess.sig=yyyyyy; gld:accts=xxxxxx; gld:accts.sig=yyyyyy
+```
+
 ⚠️ 必须是完整的一整段，**`gld:sess` 和 `gld:sess.sig` 两个都要**，只填 `gld:sess` 会返回 `No permission`
 
 
@@ -161,21 +204,23 @@ gld:sess=你的长字符串; gld:sess.sig=你的短字符串
 **正确示例**：
 
 ```text
-gld:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; gld:sess.sig=abcdef123456
+gld:sess=gld_7714d411b88155996f0a0c9ebf605faf3fbb8e21089756e6;gld:sess.sig=2d7FKXyVi9XZGXYOgoDM_1bBlq0
 ```
+
+> 💡 分号后的空格**可有可无**：`a=1;b=2` 和 `a=1; b=2` 都能正确识别，脚本自己会 trim。
 
 > ⚠️ 站点签发 Cookie 已从 `koa:sess` 改为 **`gld:sess`**，且**服务端已废弃旧的 koa 格式**：
 > 填 `koa:sess=...; koa:sess.sig=...` 会在所有域名返回 `code:-2 没有权限`，无法签到。
-> 两者不是同一种凭证（koa 是 JWT 明文，gld 是 `gld_<40位hex>` 的库内查询串），**无法本地转换**。
-> 请重新登录 glados.cloud，从 DevTools → Application → Cookies 复制新的 `gld:sess` + `gld:sess.sig`。
+> 两者不是同一种凭证（koa 是 JWT 明文，gld 是 `gld_<48位hex>` 的库内查询串），**无法本地转换**。
+> 请重新登录 glados.network，从 DevTools → Application → Cookies 复制新的 `gld:sess` + `gld:sess.sig`。
 > 脚本检测到旧格式时会打印告警，报错信息里也会提示 `鉴权失败`，方便定位。
 
 **常见错误**：
 
 - ❌ 缺少分号 `;`
-- ❌ 缺少空格（分号后需要一个空格）
+- ❌ 少了 `gld:sess.sig`（只有 `gld:sess` 会返回 `code:-2 没有权限`）
 - ❌ 值两边多了引号
-- ❌ 复制了多余的空格或换行
+- ✅ 分号后的空格多一个少一个都没关系，不用纠结
 
 
 ### 第三步：配置 GitHub Secrets 🔐
@@ -186,13 +231,21 @@ gld:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; gld:sess.sig=abcdef123456
 4. 点击右上角 **New repository secret**
 
 
-添加以下三个 Secret：
+**Secrets 页签**（同页面右上角切到 **Secrets**）：
 
 | Name             | Value                    | 必需  |
 | ---------------- | ------------------------ | ----- |
-| `GLADOS_COOKIE`  | 第二步组合的 Cookie      | ✅ 是 |
+| `GLADOS_COOKIE`  | 第二步拿到的 Cookie（JSON 整段 或 4 段请求头格式） | ✅ 是 |
+| `GLADOS_PLANS`   | 多账号兑换策略，一行一个按账号顺序对应（见上文） | ❌ 否 |
 | `TELEGRAM_BOT_TOKEN` | Telegram 机器人的 Token（例如 `123456:ABC-DEF1234...`） | ❌ 否 |
 | `TELEGRAM_CHAT_ID` | 接收推送的 Telegram Chat ID | ❌ 否 |
+
+**Variables 页签**（同一页面切到 **Variables**，不是 Secret）：
+
+| Name             | Value                    | 说明 |
+| ---------------- | ------------------------ | ---- |
+| `GLADOS_DEBUG`   | `1`                      | 打印原始接口响应、加分构成、近 14 天趋势；排查完删掉即可 |
+| `GLADOS_DOMAIN`  | `glados.network`         | 请求头格式 Cookie 的默认站点，可留空（默认就是 network） |
 ---
 
 
@@ -244,9 +297,9 @@ gld:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; gld:sess.sig=abcdef123456
 | 选项      | 填写                                                                                                   |
 | --------- | ------------------------------------------------------------------------------------------------------ |
 | **Title** | `GLaDOS 签到`                                                                                        |
-| **URL**   | `[https://api.github.com/repos/你的用户名/glados-checkin/actions/workflows/checkin.yml/dispatches`|
+| **URL**   | `https://api.github.com/repos/你的用户名/glados-checkin/actions/workflows/checkin.yml/dispatches` |
 
-> ⚠️ **重要**：把 `你的用户名` 改成你的 GitHub 用户名！`
+> ⚠️ **重要**：把 `你的用户名` 改成你的 GitHub 用户名！
 
 **执行时间**：选择每天 **07:00**（Asia/Shanghai 时区）
 
@@ -315,12 +368,13 @@ gld:sess=eyJ1c2VySWQiOjEyMzQ1Njc4OTB9; gld:sess.sig=abcdef123456
 
 ## 📂 项目文件
 
-| 文件                                                                         | 说明                |
-| ---------------------------------------------------------------------------- | ------------------- |
-| [checkin.py](file://d:\workplace\2026-glados-checkin\checkin.py)             | 核心签到脚本        |
-| `.github/workflows/checkin.yml`                                              | GitHub Actions 配置 |
-| [requirements.txt](file://d:\workplace\2026-glados-checkin\requirements.txt) | Python 依赖         |
-| `images/`                                                                    | 教程截图            |
+| 文件 | 说明 |
+| --- | --- |
+| [`checkin.py`](checkin.py) | 核心签到脚本 |
+| [`.github/workflows/checkin.yml`](.github/workflows/checkin.yml) | GitHub Actions 配置（定时 / 手动） |
+| [`.github/workflows/checkin-fast.yml`](.github/workflows/checkin-fast.yml) | 快速验证版（无启动等待，手动触发） |
+| [`requirements.txt`](requirements.txt) | Python 依赖 |
+| `images/` | 教程截图 |
 
 ---
 
@@ -334,7 +388,7 @@ MIT
 <div align="center">
 
 
-**🔧 本项目经过 2026-05-07 验证可用！**
+**🔧 本项目经过 2026-11-12 验证可用！**
 
 
 </div>
