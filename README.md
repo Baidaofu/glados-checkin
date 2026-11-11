@@ -59,6 +59,28 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 | `GLADOS_UA_ROTATE`   | ❌ 否 | `1`（默认）按账号固定分配不同 UA；`0` 全部退回同一 UA |
 | `GLADOS_USER_AGENT_<行号>` | ❌ 否 | 强制指定某一行账号的 UA，如 `GLADOS_USER_AGENT_2`，用于修 `device-mismatch` |
 | `GLADOS_DEBUG`       | ❌ 否 | `1` 开启调试：打印原始接口响应、points 历史、近 14 天趋势、加分构成（套餐/连签/线缆） |
+| `GLADOS_DOMAIN`      | ❌ 否 | 请求头格式 Cookie 的默认站点，默认 `glados.network`；JSON 导出会用自己的 `domain` 字段（优先级更高） |
+| `GLADOS_DOMAIN_<行号>` | ❌ 否 | 单独指定某一行账号的站点，如 `GLADOS_DOMAIN_3=glados.rocks` |
+| `GLADOS_PLANS`       | ❌ 否 | 一行一个兑换策略，**按账号顺序**对应；留空行=该账号不设置。行内 `#planXXX` 优先级更高 |
+
+#### 这些变量填在哪？
+
+GitHub 仓库 → **Settings → Secrets and variables → Actions**：
+
+- **Secrets** 页签：`GLADOS_COOKIE`、`GLADOS_PLANS`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`
+- **Variables** 页签：`GLADOS_DEBUG`（填 `1` 开启调试）、`GLADOS_DOMAIN`（可留空）
+
+`GLADOS_PLANS` 示例（5 个账号，按顺序对应）：
+
+```text
+off
+off
+plan200
+off
+plan100
+```
+
+> 留空行表示该账号沿用 Cookie 行尾的策略/不兑换。想临时只看日志就把 Variables 里的 `GLADOS_DEBUG` 设为 `1`，跑完再删掉即可。
 
 > 多账号反关联策略：**执行顺序每次随机打乱**（推送仍按配置行号排序）+ 账号间随机间隔 + 每账号固定不同 UA（按 Cookie 哈希决定，同账号跨运行不变，避免 device-mismatch）。
 > 若日志出现 `code=4` / `device-mismatch`，说明该账号登录时的设备指纹和脚本不一致，用 `GLADOS_USER_AGENT_<行号>` 填浏览器里真实的 UA 即可，或临时 `GLADOS_UA_ROTATE=0`。
@@ -125,7 +147,7 @@ gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 直接把整段 JSON 粘进 `GLADOS_COOKIE` 即可（多行也没问题），脚本会：
 
 - 自动拆成 `name=value; name=value; ...` 请求头；
-- 从 `domain` 字段识别 Cookie 是哪个站点的，**优先访问该域名**（比如 `glados.network` 的 Cookie 就先打 `glados.network`，不再强行先走 `glados.cloud`）；
+- 从 `domain` 字段识别 Cookie 是哪个站点的，**优先访问该域名**（比如 `glados.network` 的 Cookie 就先打 `glados.network`，不再强行先走 `glados.cloud`）；请求头格式没有域名信息时，默认走 `GLADOS_DOMAIN`（缺省 `glados.network`）；
 - 多账号时用 `[[...], [...]]`（数组套数组），每个内层数组是一个账号，末尾同样可跟 `#plan200`。
 
 > 新版登录（邮箱 / 验证码）会同时下发 **`gld:accts` / `gld:accts.sig`**；旧的 2 个 Cookie（`gld:sess` + `.sig`）仍然能鉴权，但建议整段照抄，少一个少一份可信度。

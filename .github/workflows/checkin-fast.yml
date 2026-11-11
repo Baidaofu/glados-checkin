@@ -33,3 +33,6 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GLADOS_DOMAIN: ${{ vars.GLADOS_DOMAIN }}
+          GLADOS_PLANS: ${{ secrets.GLADOS_PLANS }}
+          GLADOS_DEBUG: ${{ vars.GLADOS_DEBUG }}

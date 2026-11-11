@@ -81,6 +81,10 @@ CHALLENGE_WAIT_MAX = max(CHALLENGE_WAIT_MIN, _env_float("GLADOS_CHALLENGE_WAIT_M
 ACCOUNT_GAP_MIN = max(0.0, _env_float("GLADOS_ACCOUNT_GAP_MIN", 8.0))
 ACCOUNT_GAP_MAX = max(ACCOUNT_GAP_MIN, _env_float("GLADOS_ACCOUNT_GAP_MAX", 35.0))
 
+# 请求头格式的 cookie 本身不带域名, 默认走这个(可用 GLADOS_DOMAIN 覆盖;
+# JSON 导出会自动读 domain 字段, 优先级高于这里)
+DEFAULT_DOMAIN_ENV = os.environ.get("GLADOS_DOMAIN", "glados.network")
+
 # 调试开关: GLADOS_DEBUG=1 时打印原始接口响应(已脱敏), 用来核对积分构成/排查异常
 DEBUG = os.environ.get("GLADOS_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -328,6 +332,27 @@ def parse_account(entry: str):
     return cookie, plan, domain
 
 
+def get_plan_overrides():
+    """GLADOS_PLANS: 一行一个策略, 按 GLADOS_COOKIE 里账号的先后顺序对应
+
+    - 空行也算一个位置(表示该账号不设置策略)
+    - # 开头的行是注释, 不占位置
+    - 行内 #planXXX 优先级更高
+    """
+    raw = os.environ.get("GLADOS_PLANS", "")
+    if not raw.strip():
+        return []
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith('#'):
+            continue
+        out.append(line)
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
 def get_cookies():
     """解析 GLADOS_COOKIE, 支持三种写法:
 
@@ -366,14 +391,23 @@ def get_cookies():
                 continue
             entries.append((line, lineno))
 
+    default_domain = normalize_domain(DEFAULT_DOMAIN_ENV)
+    overrides = get_plan_overrides()
+
     accounts = []
-    for entry, lineno in entries:
+    for idx, (entry, lineno) in enumerate(entries):
         cookie, plan, domain = parse_account(entry)
         if not cookie:
             log(f"⚠️ 配置第 {lineno} 行解析为空, 已跳过")
             continue
-        if domain:
-            log(f"🔗 配置第 {lineno} 行 Cookie 属于 {domain}, 将优先访问该域名")
+        # 行内 #planXXX 优先; 否则取 GLADOS_PLANS 里同位置的策略
+        if plan is None and idx < len(overrides) and overrides[idx]:
+            plan = parse_plan(overrides[idx])
+            log(f"🎛 第 {idx + 1} 个账号(配置第 {lineno} 行)使用 GLADOS_PLANS 策略: {plan}")
+        # 域名优先级: GLADOS_DOMAIN_<行号> > JSON 里的 domain > GLADOS_DOMAIN > glados.network
+        domain = (normalize_domain(os.environ.get(f"GLADOS_DOMAIN_{lineno}"))
+                  or domain or default_domain)
+        log(f"🔗 配置第 {lineno} 行将优先访问 {domain}")
         accounts.append((cookie, plan, lineno, domain))
     return accounts
 
@@ -598,7 +632,7 @@ def explain_points(g):
     """按前端 renderPointsBreakdown 的算法, 拆出本次签到的加分来源
 
     签到分 = 基础分(服务端给, 前端只显示 +X) + 套餐加成 + 连签加成 + 线缆质量加成。
-    这里把能算的三项算出来, 用来解释"为什么只有 +1/+2 分"。
+    注意 /api/user/iqi 的真实结构是 {"code":0,"data":{"quality":{"score":..}}}。
     """
     perk = {31: 1.0, 41: 1.5, 51: 2.0}.get(g.vip, 0.0)
     streak = g.streak or 0
@@ -609,17 +643,33 @@ def explain_points(g):
     streak_bonus = 2 if streak > 14 else (1 if streak > 7 else 0)
 
     iqi = g.req('GET', '/api/user/iqi') or {}
-    score = None
-    if isinstance(iqi, dict):
-        score = (iqi.get('quality') or {}).get('score')
+    iqi_data = (iqi.get('data') or {}) if isinstance(iqi, dict) else {}
+    score = (iqi_data.get('quality') or {}).get('score')
     cable = 0
     if score:
         cable = 8 if score < 80 else 5 if score < 85 else 3 if score < 90 else 2 if score <= 95 else 1
 
-    plan = {31: "Pro", 41: "Team", 51: "Enterprise"}.get(g.vip, "Free/无套餐")
-    return (f"套餐 {plan} +{perk:g} · 连签 {streak}天 +{streak_bonus} · "
-            f"线缆 score={score if score is not None else '?'} +{cable} "
-            f"(基础分由服务端另给, 未验证的请求通常只给基础分)")
+    # network-insight 里有服务端认定的 cablePoints 和测量时间, 比前端估算准
+    insight = g.req('GET', '/api/user/network-insight') or {}
+    ins = (insight.get('data') or {}) if isinstance(insight, dict) else {}
+    cable_points = (ins.get('current') or {}).get('cablePoints')
+    measured = ins.get('updatedAt')
+
+    plan = {31: "Pro", 41: "Team", 51: "Enterprise"}.get(g.vip, f"Free/vip={g.vip}")
+    parts = [f"套餐 {plan} +{perk:g}", f"连签 {streak}天 +{streak_bonus}",
+             f"线缆 score={score if score is not None else '?'} +{cable}"
+             + (f" (服务端 cablePoints={cable_points})" if cable_points is not None else "")]
+    if measured:
+        try:
+            measured_at = datetime.fromtimestamp(measured / 1000, BEIJING_TZ)
+            parts.append(f"质量测量于 {measured_at:%Y-%m-%d %H:%M}")
+            if measured_at.strftime('%Y-%m-%d') != now_beijing('%Y-%m-%d'):
+                parts.append("⚠️ 当天还没有测量记录, 线缆分可能拿不到")
+        except Exception:
+            pass
+    else:
+        parts.append("⚠️ 服务端无质量测量记录")
+    return " · ".join(parts) + " (基础分由服务端另给)"
 
 
 def _points_delta(value):
