@@ -23,6 +23,9 @@
 ## 💡 重要说明
 GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动触发，使用 **cron-job.org**（免费服务）来触发签到。
 
+> **签到分怎么算的**：签到分 = 基础分（服务端决定）+ 套餐加成（Pro +1 / Team +1.5 / Enterprise +2）+ 连签加成（>7 天 +1 / >14 天 +2）+ 线缆质量加成（按 IQI 分数 +1~+8）。
+> 所以 **+1** 通常代表 challenge/proof 没通过、只发了基础分；**+2** 多半是「基础分 1 + 线缆 1」（免费套餐、连签不足 8 天、IQI 分数偏高），不一定是异常。设 `GLADOS_DEBUG=1` 可以看到 `🧮 加分构成: 套餐 … · 连签 … · 线缆 …` 和近 14 天趋势，对比历史就知道是否被降权。
+>
 > **2026-11 签到降权说明**：GLaDOS 新增签到风控，必须先 `GET /api/user/checkin/challenge` 拿 `nonce`，距签发 ≥2500ms 后用固定盐 `glados-observe-v1` 计算 `SHA-256(nonce + ".glados-observe-v1")` 作为 `proof` 一并提交。缺 `nonce`/`proof` 时接口仍返回成功，但只发 **1 积分**。本仓库已在 `checkin.py` 中实现完整流程，日志里会打印 `🔐 challenge nonce=…`。
 >
 >
@@ -37,6 +40,7 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 | 🎁 **兑换提示** | 显示当前可兑换选项及差额        |
 | 📱 **tg推送**   | Markdown 富文本报告：每个账号一个可折叠 `<details>` 卡片，点开展开详情（`sendRichMessage` 免费，失败自动降级旧版格式） |
 | 🔐 **防降权签到** | 自动完成 `checkin/challenge` + 随机等待 + SHA-256 proof，避免签到被降权成 1 分 |
+| 🍪 **JSON 直接可用** | 支持 Cookie-Editor 完整导出（含 `gld:accts`），并按 Cookie 所属域名优先请求 |
 | 🚦 **三态结果** | 折叠摘要一眼可辨：✅ 正常签到 / ⚠️ 检测到异常（仅 +1 分疑似降权、未拿到 challenge 等）/ ❌ 签到失败 |
 
 ---
@@ -54,6 +58,7 @@ GitHub Actions 的自带定时功能很不稳定，实测大概率不会自动�
 | `GLADOS_ACCOUNT_GAP_MIN` / `_MAX`    | ❌ 否 | 相邻账号之间的随机间隔（秒），默认 `8`~`35`，多账号靠它拉开时间 |
 | `GLADOS_UA_ROTATE`   | ❌ 否 | `1`（默认）按账号固定分配不同 UA；`0` 全部退回同一 UA |
 | `GLADOS_USER_AGENT_<行号>` | ❌ 否 | 强制指定某一行账号的 UA，如 `GLADOS_USER_AGENT_2`，用于修 `device-mismatch` |
+| `GLADOS_DEBUG`       | ❌ 否 | `1` 开启调试：打印原始接口响应、points 历史、近 14 天趋势、加分构成（套餐/连签/线缆） |
 
 > 多账号反关联策略：**执行顺序每次随机打乱**（推送仍按配置行号排序）+ 账号间随机间隔 + 每账号固定不同 UA（按 Cookie 哈希决定，同账号跨运行不变，避免 device-mismatch）。
 > 若日志出现 `code=4` / `device-mismatch`，说明该账号登录时的设备指纹和脚本不一致，用 `GLADOS_USER_AGENT_<行号>` 填浏览器里真实的 UA 即可，或临时 `GLADOS_UA_ROTATE=0`。
@@ -106,7 +111,26 @@ gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 
 ####  组合 Cookie（重要！）
 
-将两个值按以下格式组合，**注意格式必须完全正确**：
+**推荐：直接用 Cookie-Editor 导出完整 JSON**（4 个 Cookie 一键导出，不用手拼）：
+
+```json
+[
+  {"domain": "glados.network", "name": "gld:sess", "value": "gld_xxx"},
+  {"domain": "glados.network", "name": "gld:sess.sig", "value": "xxx"},
+  {"domain": "glados.network", "name": "gld:accts", "value": "gld_xxx"},
+  {"domain": "glados.network", "name": "gld:accts.sig", "value": "xxx"}
+]
+```
+
+直接把整段 JSON 粘进 `GLADOS_COOKIE` 即可（多行也没问题），脚本会：
+
+- 自动拆成 `name=value; name=value; ...` 请求头；
+- 从 `domain` 字段识别 Cookie 是哪个站点的，**优先访问该域名**（比如 `glados.network` 的 Cookie 就先打 `glados.network`，不再强行先走 `glados.cloud`）；
+- 多账号时用 `[[...], [...]]`（数组套数组），每个内层数组是一个账号，末尾同样可跟 `#plan200`。
+
+> 新版登录（邮箱 / 验证码）会同时下发 **`gld:accts` / `gld:accts.sig`**；旧的 2 个 Cookie（`gld:sess` + `.sig`）仍然能鉴权，但建议整段照抄，少一个少一份可信度。
+
+也仍然支持请求头格式：
 
 ```text
 gld:sess=你的长字符串; gld:sess.sig=你的短字符串

@@ -81,6 +81,13 @@ CHALLENGE_WAIT_MAX = max(CHALLENGE_WAIT_MIN, _env_float("GLADOS_CHALLENGE_WAIT_M
 ACCOUNT_GAP_MIN = max(0.0, _env_float("GLADOS_ACCOUNT_GAP_MIN", 8.0))
 ACCOUNT_GAP_MAX = max(ACCOUNT_GAP_MIN, _env_float("GLADOS_ACCOUNT_GAP_MAX", 35.0))
 
+# 调试开关: GLADOS_DEBUG=1 时打印原始接口响应(已脱敏), 用来核对积分构成/排查异常
+DEBUG = os.environ.get("GLADOS_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Cookie-Editor 完整导出里除 gld:sess/.sig 外还会带 gld:accts/.sig (多账号身份列表),
+# 新版登录(邮箱/验证码)都会下发; 只带 gld:sess 也仍可鉴权, 但建议整段照抄。
+ACCTS_SESS = "gld:accts"
+
 DOMAINS = [
     "https://glados.cloud",
     "https://railgun.info",
@@ -187,17 +194,100 @@ def diagnose_cookie(cookie: str):
         issues.append(
             f"{CURRENT_SESS}.sig 过短({len(sig)} 位, 期望约 27 位), 复制可能不完整")
 
+    # gld:accts 是新版登录额外下发的账号列表 Cookie, 只校验格式, 缺失不报错
+    accts = parts.get(ACCTS_SESS)
+    if accts is not None:
+        if not accts.startswith(SESS_PREFIX):
+            issues.append(
+                f"{ACCTS_SESS} 值不以 '{SESS_PREFIX}' 开头( actual: '{accts[:8]}...'), "
+                f"复制可能不完整")
+        elif len(accts) - len(SESS_PREFIX) != SESS_HEX_LEN:
+            issues.append(
+                f"{ACCTS_SESS} 长度异常: 期望 {SESS_PREFIX}后 {SESS_HEX_LEN} 位, "
+                f"实际 {len(accts) - len(SESS_PREFIX)} 位")
+        if ACCTS_SESS + ".sig" not in parts:
+            issues.append(f"有 {ACCTS_SESS} 但缺少 {ACCTS_SESS}.sig, 建议整段重新复制")
+
     return issues
 
 
-def extract_cookie(raw: str):
-    """归一化一行 cookie:
-    - 已带 gld:sess= -> 原样返回 (需同时带 gld:sess.sig)
-    - koa:sess= -> 旧版格式, 服务端已废弃, 告警提示重新获取
-    - JSON {"token": "..."} 或裸 JWT -> 补 CURRENT_SESS 前缀
+def _split_plan(entry: str):
+    """把 'cookie#plan200' 拆成 (cookie, 'plan200'); 没有 # 后缀返回 (entry, None)"""
+    if '#' in entry:
+        body, plan_raw = entry.rsplit('#', 1)
+        return body.strip(), plan_raw
+    return entry.strip(), None
+
+
+def normalize_domain(dom):
+    """把 Cookie-Editor 的 domain 字段规整成 https://host"""
+    if not dom:
+        return None
+    dom = str(dom).strip().lstrip('.').lower()
+    if not dom:
+        return None
+    if not dom.startswith(('http://', 'https://')):
+        dom = 'https://' + dom
+    return dom.rstrip('/')
+
+
+def _json_cookie_pairs(obj):
+    """从 Cookie-Editor 导出结构里取出 [(name, value)] 和 gld:sess 所在域名
+
+    支持三种形态:
+    - 完整导出: [{"name": "gld:sess", "value": "...", "domain": "glados.network"}, ...]
+    - 单个 cookie 对象: {"name": "...", "value": "...", "domain": "..."}
+    - 旧版 {"token": "..."} 或 {"gld:sess": "...", ...} 映射
     """
-    if not raw: return None
+    if isinstance(obj, dict):
+        if isinstance(obj.get('token'), str):
+            return [('koa:sess', obj['token'])], None
+        if 'name' in obj and 'value' in obj:
+            return [(str(obj['name']), str(obj['value']))], obj.get('domain')
+        pairs = [(k, v) for k, v in obj.items() if isinstance(v, str)]
+        return pairs, None
+
+    pairs, dom = [], None
+    if isinstance(obj, list):
+        for item in obj:
+            if not isinstance(item, dict):
+                continue
+            name, value = item.get('name'), item.get('value')
+            if not name or value is None:
+                continue
+            pairs.append((str(name), str(value)))
+            if dom is None and str(name) == CURRENT_SESS:
+                dom = item.get('domain')
+    return pairs, dom
+
+
+def extract_cookie(raw: str):
+    """归一化 cookie, 返回 (cookie字符串, 建议优先访问的域名或 None)
+
+    支持:
+    - 请求头格式: gld:sess=...; gld:sess.sig=...; gld:accts=...; gld:accts.sig=...
+    - Cookie-Editor 完整 JSON 导出 (数组/对象), 顺便取回 cookie 所属域名
+    - 旧版 {"token": "..."} / 裸 JWT -> 补 koa:sess 前缀
+    """
+    if not raw:
+        return None, None
     raw = raw.strip()
+
+    if raw.startswith(('{', '[')):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            obj = None
+        if obj is not None:
+            pairs, dom = _json_cookie_pairs(obj)
+            if pairs:
+                cookie = '; '.join(f'{n}={v}' for n, v in pairs)
+                for issue in diagnose_cookie(cookie):
+                    log(f"⚠️ {issue}")
+                if CURRENT_SESS not in dict(pairs):
+                    log(f"⚠️ JSON 里没有 {CURRENT_SESS}, 该账号无法签到")
+                return cookie, normalize_domain(dom)
+
     for name in SESS_NAMES:
         if f'{name}=' in raw or f'{name}.sig=' in raw:
             if name == CURRENT_SESS:
@@ -207,14 +297,15 @@ def extract_cookie(raw: str):
             else:
                 log(f"⚠️ 检测到旧版 {DEPRECATED_SESS} Cookie, 站点已改用 {CURRENT_SESS} 并废弃旧格式, "
                     f"该账号签到必然失败; 请重新登录 glados.cloud 复制新的 {CURRENT_SESS} Cookie")
-            return raw
+            return raw, None
     if raw.startswith('{'):
         try:
-            return CURRENT_SESS + '=' + json.loads(raw).get('token')
-        except: pass
+            return CURRENT_SESS + '=' + json.loads(raw).get('token'), None
+        except Exception:
+            pass
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
-        return CURRENT_SESS + '=' + raw
-    return raw
+        return CURRENT_SESS + '=' + raw, None
+    return raw, None
 
 def parse_plan(value):
     """解析行尾兑换策略: plan100/plan200/plan500 或 off(不兑换)"""
@@ -227,43 +318,90 @@ def parse_plan(value):
     return OFF_PLAN
 
 def parse_account(entry: str):
-    """解析一行账号: cookie#策略。行尾无 # 后缀 = 只签到不兑换"""
-    if '#' in entry:
-        raw, plan_raw = entry.rsplit('#', 1)
-        return extract_cookie(raw), parse_plan(plan_raw)
-    return extract_cookie(entry), None  # None = 未设置兑换策略
+    """解析一个账号: cookie#策略。行尾无 # 后缀 = 只签到不兑换
+
+    返回 (cookie, plan, domain)。cookie 可以是请求头格式, 也可以是 Cookie-Editor 的 JSON。
+    """
+    body, plan_raw = _split_plan(entry)
+    cookie, domain = extract_cookie(body)
+    plan = parse_plan(plan_raw) if plan_raw is not None else None
+    return cookie, plan, domain
+
 
 def get_cookies():
-    """GLADOS_COOKIE 一行一个账号，# 开头的行视为注释跳过"""
+    """解析 GLADOS_COOKIE, 支持三种写法:
+
+    1) 一行一个账号: gld:sess=...; gld:sess.sig=...#plan200
+    2) 一整段 Cookie-Editor JSON 数组 (多行也行) = 1 个账号, 末尾可跟 #策略
+    3) 数组套数组 [[...],[...]] = 多个账号, 每项一个 Cookie-Editor 导出
+
+    # 开头的行是注释。返回 [(cookie, plan, lineno, domain)]。
+    """
     raw = os.environ.get("GLADOS_COOKIE", "")
-    if not raw:
+    if not raw.strip():
         log("❌ 未配置 GLADOS_COOKIE")
         return []
+
+    entries = []  # [(raw_entry, lineno)]
+    body, plan_raw = _split_plan(raw)
+    obj, parsed = None, False
+    try:
+        obj = json.loads(body)
+        parsed = True
+    except Exception:
+        pass
+
+    if parsed and isinstance(obj, list) and obj and all(isinstance(x, list) for x in obj):
+        # [[cookie_obj...], [cookie_obj...]] -> 多账号
+        suffix = f'#{plan_raw}' if plan_raw else ''
+        for i, one in enumerate(obj, 1):
+            entries.append((json.dumps(one, ensure_ascii=False) + suffix, i))
+    elif parsed:
+        # 一整段 JSON = 1 个账号
+        entries.append((raw.strip(), 1))
+    else:
+        for lineno, line in enumerate(raw.splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            entries.append((line, lineno))
+
     accounts = []
-    for lineno, line in enumerate(raw.splitlines(), 1):
-        line = line.strip()
-        if not line or line.startswith('#'):
+    for entry, lineno in entries:
+        cookie, plan, domain = parse_account(entry)
+        if not cookie:
+            log(f"⚠️ 配置第 {lineno} 行解析为空, 已跳过")
             continue
-        cookie, plan = parse_account(line)
-        accounts.append((cookie, plan, lineno))
+        if domain:
+            log(f"🔗 配置第 {lineno} 行 Cookie 属于 {domain}, 将优先访问该域名")
+        accounts.append((cookie, plan, lineno, domain))
     return accounts
 
 # ================= 核心逻辑 =================
 
 class GLaDOS:
-    def __init__(self, cookie, ua=None):
+    def __init__(self, cookie, ua=None, domain=None):
         self.cookie = cookie
         self.ua = ua or pick_ua(cookie)
-        self.domain = DOMAINS[0]
+        # Cookie 是从哪个域登录下发的就优先打哪个域, 避免跨域 token 导致降权
+        self.domain = normalize_domain(domain) or DOMAINS[0]
         self.email = "?"
         self.left_days = "?"
         self.points = "0"
         self.points_change = "?"
         self.challenge_ok = None  # None=未尝试 / True=拿到 nonce / False=降级为无 proof 请求
+        self.points_raw = None
+        self.vip = None
+        self.level = None
+        self.streak = None
         self.exchange_info = ""
         
+    def _domain_order(self):
+        """优先当前/配置的域名, 再依次回退其它入口"""
+        return [self.domain] + [d for d in DOMAINS if d != self.domain]
+
     def req(self, method, path, data=None):
-        for d in DOMAINS:
+        for d in self._domain_order():
             try:
                 url = f"{d}{path}"
                 h = HEADERS.copy()
@@ -277,6 +415,8 @@ class GLaDOS:
                 else:
                     resp = requests.post(url, headers=h, json=data, timeout=10)
                 
+                if DEBUG:
+                    log(f"📡 {method} {d}{path} -> HTTP {resp.status_code}")
                 if resp.status_code == 200:
                     self.domain = d
                     return resp.json()
@@ -291,13 +431,17 @@ class GLaDOS:
             d = res['data']
             self.email = d.get('email', 'Unknown')
             self.left_days = str(d.get('leftDays', '?')).split('.')[0]
+            self.vip = d.get('vip')
+            self.level = d.get('level')
             return True
         return False
 
     def get_points(self):
         res = self.req('GET', '/api/user/points')
+        self.points_raw = res
         if res and 'points' in res:
             self.points = str(res.get('points', '0')).split('.')[0]
+            self.streak = res.get('streak')
             history = res.get('history', [])
             if history:
                 last = history[0]
@@ -450,6 +594,34 @@ def _legacy_block(r):
         lines.append(f"🎁 可兑换选项:\n{e(_clip(r['options'], 600))}")
     return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
 
+def explain_points(g):
+    """按前端 renderPointsBreakdown 的算法, 拆出本次签到的加分来源
+
+    签到分 = 基础分(服务端给, 前端只显示 +X) + 套餐加成 + 连签加成 + 线缆质量加成。
+    这里把能算的三项算出来, 用来解释"为什么只有 +1/+2 分"。
+    """
+    perk = {31: 1.0, 41: 1.5, 51: 2.0}.get(g.vip, 0.0)
+    streak = g.streak or 0
+    try:
+        streak = int(float(streak))
+    except (TypeError, ValueError):
+        streak = 0
+    streak_bonus = 2 if streak > 14 else (1 if streak > 7 else 0)
+
+    iqi = g.req('GET', '/api/user/iqi') or {}
+    score = None
+    if isinstance(iqi, dict):
+        score = (iqi.get('quality') or {}).get('score')
+    cable = 0
+    if score:
+        cable = 8 if score < 80 else 5 if score < 85 else 3 if score < 90 else 2 if score <= 95 else 1
+
+    plan = {31: "Pro", 41: "Team", 51: "Enterprise"}.get(g.vip, "Free/无套餐")
+    return (f"套餐 {plan} +{perk:g} · 连签 {streak}天 +{streak_bonus} · "
+            f"线缆 score={score if score is not None else '?'} +{cable} "
+            f"(基础分由服务端另给, 未验证的请求通常只给基础分)")
+
+
 def _points_delta(value):
     """把 "+10"/"-1"/"1.5" 这类积分变化转成 float, 解析失败返回 None"""
     try:
@@ -551,20 +723,42 @@ def main():
         log(f"🎲 本次执行顺序: {[cookies[i][2] for i in order]} (配置行号)")
 
     for pos, idx in enumerate(order):
-        cookie, plan, lineno = cookies[idx]
+        cookie, plan, lineno, cookie_domain = cookies[idx]
         if pos:
             gap = random.uniform(ACCOUNT_GAP_MIN, ACCOUNT_GAP_MAX)
             log(f"⏳ 账号之间随机间隔 {gap:.1f}s")
             time.sleep(gap)
 
         # 可选: GLADOS_USER_AGENT_<行号> 强制指定某账号 UA(填浏览器里真实的 UA 可规避 device-mismatch)
-        g = GLaDOS(cookie, ua=os.environ.get(f"GLADOS_USER_AGENT_{lineno}") or None)
+        g = GLaDOS(cookie,
+                   ua=os.environ.get(f"GLADOS_USER_AGENT_{lineno}") or None,
+                   domain=cookie_domain)
         # 鉴权失败时 email 取不到, 用配置行号定位是哪个账号出问题
         g.lineno = lineno
-        
+        if DEBUG:
+            log(f"🧪 第 {lineno} 行 UA={g.ua}")
+
         checkin_res = g.checkin()
         g.get_status()
         g.get_points()
+
+        if DEBUG:
+            try:
+                log("📊 checkin 原始响应: " + json.dumps(checkin_res, ensure_ascii=False)[:1200])
+            except Exception:
+                log(f"📊 checkin 原始响应: {checkin_res}")
+            try:
+                hist = ((g.points_raw or {}).get('history') or [])[:3]
+                log("📊 points.history 前 3 条: " + json.dumps(hist, ensure_ascii=False)[:800])
+            except Exception:
+                pass
+            log("🧮 加分构成: " + explain_points(g))
+            trend = g.req('GET', '/api/user/points/trend?days=14')
+            try:
+                days = ((trend or {}).get('data') or {}).get('days') or []
+                log("📈 近 14 天积分: " + json.dumps(days[-14:], ensure_ascii=False)[:900])
+            except Exception:
+                log(f"📈 趋势接口异常: {trend}")
         
         # --- 核心判定逻辑修改 ---
         raw_msg = checkin_res.get('message', 'Failure') if checkin_res else "Network Error"
@@ -613,7 +807,6 @@ def main():
                 warn = True
                 reasons.append("未获取到 challenge, 已降级请求")
             if warn:
-                msg += " — " + "；".join(reasons)
                 hint = ("本次签到被服务端降权/走降级请求: 检查日志里有没有 "
                         "🔐 challenge 那行; 如果一直 +1 分, 该账号可能被风控, 建议手动登录一次或换 UA")
         else:
@@ -631,9 +824,22 @@ def main():
             exchange_msg = f"积分不足 ({current_pts}/{need_pts})"
             if current_pts >= need_pts:
                 ex_res = g.exchange(plan)
-                exchange_msg = ex_res.get('message', '提交失败')
+                if isinstance(ex_res, dict):
+                    exchange_msg = ex_res.get('message', '提交失败')
+                    if ex_res.get('code') not in (0, None):
+                        warn = True
+                        reasons.append(f"兑换失败: {exchange_msg}")
+                else:
+                    # 网络抖动/接口异常时可能返回 None, 不能让整份报告崩掉
+                    exchange_msg = "兑换请求失败(网络或接口异常)"
+                    warn = True
+                    reasons.append("兑换请求无响应")
                 g.get_status()
                 g.get_points()
+
+        # 异常原因统一追加到签到文案, 折叠标题里也会显示第一条
+        if warn and reasons:
+            msg += " — " + "；".join(dict.fromkeys(reasons))
 
         # 展示用策略: 空着与 #off 行为一致, 统一显示 #off
         plan_desc = plan_label(plan)
